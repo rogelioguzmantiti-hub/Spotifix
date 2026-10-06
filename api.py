@@ -89,7 +89,7 @@ db = SQLAlchemy(app)
 
 Bot_name = "Spotifix"
 global_bot_name = "SpotiFix"
-Bot_version = "4.6.15"
+Bot_version = "4.5.1"
 GITHUB_REPO = "rogelioguzmantiti-hub/Spotifix"
 backend_state = 'Initializing...'
 akey = 'jonex program key'.encode('utf-8')
@@ -265,21 +265,6 @@ config_validate_proxy = False
 proxy_blocked_devices = set()
 _multi_sound_ok_devices = set()
 _multi_sound_bad_devices = set()
-_dashboard_np_cache = {}
-# Cap concurrent adb subprocesses: with 50-100 phones every thread spawning its
-# own adb.exe process at once overwhelms the adb server. 6 is plenty for a PC
-# (each command is <2s); threads just queue up instead of tripping adb.
-_adb_sem = threading.Semaphore(6)
-_dashboard_lock = threading.Lock()
-_dashboard_worker_stop = threading.Event()
-
-
-def bot_running_now():
-    """Cheap check: any worker thread alive right now."""
-    try:
-        return bool(worker_threads)
-    except Exception:
-        return False
 
 settings_capsolver_api_key = None
 
@@ -475,67 +460,60 @@ def create_token(info):
     return unhashed_token
 
 
-def _cached_getprop(udid, propname, ttl_seconds=60):
-    """getprop with TTL cache: device props never change mid-session; avoids
-    hammering adb with 4-5 subprocess calls per device on every scrape."""
-    key = ('getprop', udid, propname)
-    now = time.time()
-    val = _prop_cache.get(key)
-    if val is not None and (now - val[0]) < ttl_seconds:
-        return val[1]
-    try:
-        with _adb_sem:
-            result = subprocess.run(
-                [adb_path, '-s', udid, 'shell', 'getprop', propname],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=8,
-                startupinfo=startupinfo
-            )
-        out = result.stdout.strip()
-    except Exception:
-        out = ''
-    _prop_cache[key] = (now, out)
-    return out
-
-
 def get_device_manufacturer(udid):
-    return _cached_getprop(udid, 'ro.product.manufacturer')
+    result = subprocess.run(
+        [adb_path, '-s', udid, 'shell', 'getprop', 'ro.product.manufacturer'],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        startupinfo=startupinfo
+    )
+    return result.stdout.strip()
 
 def get_device_model(udid):
-    return _cached_getprop(udid, 'ro.product.model')
+    result = subprocess.run(
+        [adb_path, '-s', udid, 'shell', 'getprop', 'ro.product.model'],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        startupinfo=startupinfo
+    )
+    return result.stdout.strip()
 
 def get_device_hardware_id(udid):
-    return _cached_getprop(udid, 'ro.serialno')
+    result = subprocess.run(
+        [adb_path, '-s', udid, 'shell', 'getprop', 'ro.serialno'],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        startupinfo=startupinfo
+    )
+    return result.stdout.strip()
 
 def get_device_android_version(udid):
-    return _cached_getprop(udid, 'ro.build.version.release')
-
-def get_device_sdk_version(udid):
-    return _cached_getprop(udid, 'ro.build.version.sdk')
+    result = subprocess.run(
+        [adb_path, '-s', udid, 'shell', 'getprop', 'ro.build.version.release'],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        startupinfo=startupinfo
+    )
+    return result.stdout.strip()
 
 
 def get_device_spotify_version(udid, pkg='com.spotify.music'):
-    key = ('dumpsys_pkg', udid, pkg)
-    now = time.time()
-    val = _prop_cache.get(key)
-    if val is not None and (now - val[0]) < 120:
-        return val[1]
-    try:
-        with _adb_sem:
-            result = subprocess.run(
-                [adb_path, '-s', udid, 'shell', 'dumpsys', 'package', pkg],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10,
-                startupinfo=startupinfo
-            )
-        out = result.stdout or ''
-        version = None
-        for line in out.splitlines():
-            if 'versionName=' in line and 'minSdk' not in line:
-                version = line.strip().split('versionName=')[-1].strip()
-                break
-    except Exception:
-        version = None
-    _prop_cache[key] = (now, version)
-    return version
+    result = subprocess.run(
+        [adb_path, '-s', udid, 'shell', 'dumpsys', 'package', pkg],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        startupinfo=startupinfo
+    )
+    out = result.stdout or ''
+    for line in out.splitlines():
+        if 'versionName=' in line and 'minSdk' not in line:
+            return line.strip().split('versionName=')[-1].strip()
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1122,6 +1100,90 @@ def load_settings():
         return jsonify({"error": f"Failed to load settings: {str(e)}"}), 500
 
 
+def _capsolver_post(path, payload, timeout=15):
+    """POST a api.capsolver.com que funciona aunque el DNS del WiFi este caido.
+
+    Intenta lo normal primero; si falla el DNS, resuelve via DoH contra
+    1.1.1.1 (IP literal, sin DNS) y conecta por IP con TLS verificado (SNI).
+    """
+    import socket as _sock
+    import ssl as _ssl
+    body = json.dumps(payload).encode()
+
+    def _read_all(ss):
+        resp = b""
+        while True:
+            try:
+                c = ss.recv(65536)
+            except Exception:
+                break
+            if not c:
+                break
+            resp += c
+        try:
+            ss.close()
+        except Exception:
+            pass
+        head, _, rest = resp.partition(b"\r\n\r\n")
+        if b"transfer-encoding: chunked" in head.lower():
+            out = b""
+            while rest:
+                line, _, rest = rest.partition(b"\r\n")
+                try:
+                    n = int(line.strip().split(b";")[0], 16)
+                except Exception:
+                    break
+                if n == 0:
+                    break
+                out += rest[:n]
+                rest = rest[n + 2:]
+            return out
+        return rest
+
+    def _do(host, ip=None):
+        s = _sock.create_connection((ip or host, 443), timeout=timeout)
+        ctx = _ssl.create_default_context()
+        ss = ctx.wrap_socket(s, server_hostname=host)
+        ss.sendall(("POST %s HTTP/1.1\r\nHost: %s\r\nContent-Type: application/json\r\n"
+                     "Content-Length: %d\r\nConnection: close\r\n\r\n" % (path, host, len(body))).encode() + body)
+        return json.loads(_read_all(ss).decode())
+
+    try:
+        import urllib.request as _u
+        req = _u.Request("https://api.capsolver.com" + path, data=body,
+                         headers={"Content-Type": "application/json"})
+        return json.loads(_u.urlopen(req, timeout=timeout).read().decode())
+    except Exception:
+        pass
+    s = _sock.create_connection(("1.1.1.1", 443), timeout=timeout)
+    ctx = _ssl.create_default_context()
+    ss = ctx.wrap_socket(s, server_hostname="cloudflare-dns.com")
+    ss.sendall(b"GET /dns-query?name=api.capsolver.com&type=A HTTP/1.1\r\n"
+                b"Host: cloudflare-dns.com\r\nAccept: application/dns-json\r\n"
+                b"Connection: close\r\n\r\n")
+    ans = json.loads(_read_all(ss).decode())
+    ip = ans["Answer"][0]["data"]
+    return _do("api.capsolver.com", ip)
+
+
+@app.route('/capsolver_balance', methods=['GET'])
+@require_token
+def capsolver_balance():
+    try:
+        key = settings_capsolver_api_key or ''
+        if not key:
+            return jsonify({"error": "CapSolver API key no configurada"}), 400
+        r = _capsolver_post('/getBalance', {'clientKey': key})
+        if r.get('errorId') == 0:
+            return jsonify({"balance": r.get('balance')}), 200
+        return jsonify({"error": r.get('errorDescription', 'CapSolver error')}), 502
+    except Exception as e:
+        msg = str(e)
+        if 'getaddrinfo' in msg or 'NameResolution' in msg or 'nodename' in msg:
+            msg = "sin internet/DNS (revisa tu conexion)"
+        return jsonify({"error": f"No se pudo consultar saldo: {msg}"}), 502
+
+
 @app.route('/check_cred', methods=['POST'])
 def check_cred():
     try:
@@ -1543,7 +1605,12 @@ def device_android_versions():
 
         def _getprop(serial, prop):
             try:
-                return _cached_getprop(serial, prop, ttl_seconds=60)
+                r = subprocess.run(
+                    [adb_path, '-s', serial, 'shell', 'getprop', prop],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                    startupinfo=startupinfo, timeout=10
+                )
+                return r.stdout.strip()
             except Exception:
                 return ''
 
@@ -1894,22 +1961,7 @@ def get_dashboard():
             if app_key not in active:
                 continue
             pkg, label = app_map[app_key]
-            # Read the warm cache maintained by _dashboard_np_refresh_worker.
-            # NEVER runs dumpsys here: instant response with 100 devices.
-            with _dashboard_lock:
-                cached = _dashboard_np_cache.get((udid, pkg))
-            if cached:
-                state, title, artist = cached['state'], cached['title'], cached['artist']
-            elif bot_running_now():
-                # Warm the entry asynchronously instead of blocking the request.
-                try:
-                    state, title, artist = _get_now_playing(udid, pkg)
-                    with _dashboard_lock:
-                        _dashboard_np_cache[(udid, pkg)] = {'ts': time.time(), 'state': state, 'title': title, 'artist': artist}
-                except Exception:
-                    state, title, artist = 'unknown', '', ''
-            else:
-                state, title, artist = 'unknown', '', ''
+            state, title, artist = _get_now_playing(udid, pkg)
             app_states.append({
                 'udid': udid,
                 'app': label,
@@ -2280,7 +2332,7 @@ def solve_spotify_captcha(udid):
         sitekey = '6LeO36obAAAAALSBZrY6RYM1hcAY7RLvpDDcJLy3'
         payload = {'clientKey': settings_capsolver_api_key,
                    'task': {'type': 'ReCaptchaV2EnterpriseTaskProxyLess',
-                            'websiteURL': page_url, 'websiteKey': sitekey, 'isInvisible': False}}
+                            'websiteURL': page_url, 'websiteKey': sitekey}}
         req = _urlreq.Request('https://api.capsolver.com/createTask',
                               data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json'})
         r = json.loads(_urlreq.urlopen(req, timeout=60).read().decode())
@@ -2516,9 +2568,18 @@ def spotify_login(d, account, udid=None):
             try:
                 cur = d.app_current()
                 if str(cur.get('package', '')).startswith('com.android.chrome') or str(cur.get('package', '')).startswith('com.android.chromium'):
-                    print(f"reCAPTCHA CustomTab detected: {cur.get('package')} - waiting for user to solve it manually")
+                    print(f"reCAPTCHA CustomTab detected: {cur.get('package')} - trying CapSolver auto-solve")
                     if udid:
-                        # manual captcha resolution: wait until the user solves
+                        try:
+                            if solve_spotify_captcha(udid):
+                                print("CapSolver solved captcha, continuing Automatizar flow")
+                                time.sleep(3)
+                                continue
+                            else:
+                                print("CapSolver auto-solve failed, falling back to manual wait")
+                        except Exception as _cs_e:
+                            print(f"CapSolver auto-solve error: {_cs_e}, falling back to manual wait")
+                        # fallback manual: wait until the user solves
                         # the challenge and the CustomTab closes (back to Spotify)
                         while time.time() < _captcha_wait_deadline:
                             time.sleep(3)
@@ -5108,12 +5169,11 @@ def _app_generic_restart_if_crashed(d, restart, pkg):
 def _adb_shell(udid, cmd):
     """Run an adb shell command via subprocess (no UiAutomation needed)."""
     try:
-        with _adb_sem:
-            result = subprocess.run(
-                [adb_path, '-s', udid, 'shell'] + cmd.split(),
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10,
-                startupinfo=startupinfo
-            )
+        result = subprocess.run(
+            [adb_path, '-s', udid, 'shell'] + cmd.split(),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10,
+            startupinfo=startupinfo
+        )
         return result.stdout.strip()
     except Exception as e:
         return ''
@@ -5267,17 +5327,9 @@ def _songs_for_type(link_type, explicit_count=None):
 
 
 
-_panda_map_cache = {'ts': 0.0, 'map': None}
-_prop_cache = {}
-
-
-def _get_panda_numbers(use_cache=True):
+def _get_panda_numbers():
     """Read Panda's device.db and return {serial: panda_number}."""
     import sqlite3 as _sqlite3
-    if use_cache:
-        _now_ = time.time()
-        if _panda_map_cache['map'] is not None and (_now_ - _panda_map_cache['ts']) < 15:
-            return _panda_map_cache['map']
     result_map = {}
     candidates = [
         os.path.join(os.environ.get('APPDATA', ''), '6WPTMA9HZO', 'device.db'),
@@ -5299,38 +5351,25 @@ def _get_panda_numbers(use_cache=True):
                     result_map[str(serial).strip()] = sort_num
             conn.close()
             if result_map:
-                _panda_map_cache['ts'] = time.time()
-                _panda_map_cache['map'] = result_map
                 return result_map
         except Exception:
             continue
-    _panda_map_cache['ts'] = time.time()
-    _panda_map_cache['map'] = result_map
     return result_map
 
 
 def _get_now_playing(udid, pkg):
-    """Query media_session to get current song title and state for a given package.
-    Returns (state, title, artist) where state can also be 'PLAYING_STALE' when the
-    player claims PLAYING but its position/updated timestamp has NOT advanced
-    (stuck buffer glitch). The monitor treats that like a dead player."""
+    """Query media_session to get current song title and state for a given package."""
     try:
-        import time as _time
-        now_ms = int(_time.time() * 1000)
-        with _adb_sem:
-            result = subprocess.run(
-                [adb_path, '-s', udid, 'shell', 'dumpsys', 'media_session'],
-                capture_output=True, text=True, timeout=10, startupinfo=startupinfo
-            )
+        result = subprocess.run(
+            [adb_path, '-s', udid, 'shell', 'dumpsys', 'media_session'],
+            capture_output=True, text=True, timeout=10, startupinfo=startupinfo
+        )
         output = result.stdout or ''
         lines = output.split('\n')
         current_pkg = None
         state = 'unknown'
         title = ''
         artist = ''
-        updated_ms = None
-        position_ms = 0
-        speed = None
         for line in lines:
             stripped = line.strip()
             if stripped.startswith('package='):
@@ -5338,21 +5377,9 @@ def _get_now_playing(udid, pkg):
             if current_pkg == pkg:
                 if 'state=' in stripped and 'PlaybackState' in stripped:
                     m = re.search(r'state=(\d+)', stripped)
-                    u = re.search(r'updated=(\d+)', stripped)
-                    p = re.search(r'position=(\d+)', stripped)
-                    sp = re.search(r'speed=([\d.]+)', stripped)
                     if m:
                         s = int(m.group(1))
                         state = {0: 'STOPPED', 1: 'PAUSED', 2: 'BUFFERING', 3: 'PLAYING'}.get(s, f'STATE_{s}')
-                    if u:
-                        updated_ms = int(u.group(1))
-                    if p:
-                        position_ms = int(p.group(1))
-                    if sp:
-                        try:
-                            speed = float(sp.group(1))
-                        except ValueError:
-                            speed = None
                 if stripped.startswith('metadata:') and 'description=' in stripped:
                     mm = re.search(r'description=([^,\n]+),\s*([^,\n]+)', stripped)
                     if mm:
@@ -5361,24 +5388,9 @@ def _get_now_playing(udid, pkg):
                         if 'null' not in t.lower() and 'anuncio' not in t.lower() and t:
                             title = t
                             artist = a
-        state_adj = state
-        # NOTE: 'updated' in dumpsys media_session does NOT advance for every app
-        # when several sessions coexist (Samsung Multi Sound centralizes the
-        # session). state=PLAYING + speed=1.0 IS the truth; position/updated may
-        # simply not tick. So do NOT mark PLAYING_STALE on stale updated alone.
-        if state == 'BUFFERING':
-            # Only a BUFFERING with speed=0.0 AND an ancient 'updated' is a frozen
-            # buffer (queue dropped). Guard against false staleness.
-            if updated_ms is not None and (now_ms - updated_ms) > 60000 and position_ms == 0:
-                state_adj = 'BUFFERING_STALE'
-        elif state in ('PLAYING', 'PAUSED'):
-            # speed=0.0 with PLAYING means the player object exists but audio is
-            # NOT advancing (the actual stall we want to catch).
-            if speed == 0.0 and updated_ms is not None and (now_ms - updated_ms) > 60000:
-                state_adj = 'PLAYING_STALE'
         if title:
-            return state_adj, title, artist
-        return state_adj, '', ''
+            return state, title, artist
+        return state, '', ''
     except Exception as e:
         return 'ERROR', '', str(e)
 
@@ -5387,77 +5399,64 @@ def _open_spotify_human(d, udid, link, artist_name, album_name, pkg='com.spotify
     if _stop_requested(udid):
         return False
     """Open Spotify and navigate to a link like a human: launch, dismiss dialogs,
-    go to Search tab, type artist+album (letter by letter), press enter, select the
-    result and verify the playing song belongs to the LINK. The intent deep-link is
-    only a last-resort fallback after 2 failed human attempts."""
+    go to Search tab, type artist+album, select result, play."""
     spotify_version = get_device_spotify_version(udid, pkg)
 
-    # ---- HUMAN FLOW (always first): search artist + album, pick the album row ----
-    def _human_locate_search_field():
-        qf = d(resourceId=spotify_ui(pkg, spotify_version, 'query'))
-        if not qf.exists(timeout=2):
-            d.click(540, 360)
-            _human_delay(1.0, 2.0)
-        qf = d(resourceId=spotify_ui(pkg, spotify_version, 'query'))
-        ef = d(className='android.widget.EditText')
-        return qf if qf.exists(timeout=2) else (ef if ef.exists(timeout=2) else None)
+    if not str(d.app_current()).lower().__contains__('spotify'):
+        d.app_start(pkg, ".MainActivity")
+    _human_delay(2.0, 4.0)
 
-    def _human_search_and_open():
-        """Full human search: navigate -> type (slow, letter-like) -> enter ->
-        click exact album row. Returns True if a plausible album was opened."""
-        nonlocal d  # 'd = _newd' below would otherwise create a local var
-        if not str(d.app_current()).lower().__contains__('spotify'):
-            # Open Spotify like a human (press HOME then tap the icon via launcher).
-            _adb_go_home(udid)
-            _human_delay(1.0, 2.0)
-            d.app_start(pkg, ".MainActivity")
-        _human_delay(2.0, 4.0)
+    d(resourceId=spotify_ui(pkg, spotify_version, 'later_button')).click_exists(1)
+    d(resourceId=spotify_ui(pkg, spotify_version, 'dismiss_text')).click_exists(1)
+    _human_delay(0.5, 1.5)
 
-        d(resourceId=spotify_ui(pkg, spotify_version, 'later_button')).click_exists(1)
-        d(resourceId=spotify_ui(pkg, spotify_version, 'dismiss_text')).click_exists(1)
-        _human_delay(0.5, 1.5)
+    for _ in range(4):
+        if d(resourceId=spotify_ui(pkg, spotify_version, 'navigation_bar')).exists(timeout=2):
+            break
+        d.press('back')
+        _human_delay(0.8, 1.5)
 
-        for _ in range(4):
-            if d(resourceId=spotify_ui(pkg, spotify_version, 'navigation_bar')).exists(timeout=2):
-                break
-            d.press('back')
-            _human_delay(0.8, 1.5)
+    add_log("INFO", udid, f"[Spotify Human] Navigating to Search tab...")
 
-        add_log("INFO", udid, f"[Spotify Human] Navigating to Search tab...")
-
-        if d(resourceId=spotify_ui(pkg, spotify_version, 'search_tab')).exists:
+    if d(resourceId=spotify_ui(pkg, spotify_version, 'search_tab')).exists:
+        _human_delay(0.3, 0.8)
+        d(resourceId=spotify_ui(pkg, spotify_version, 'search_tab')).click()
+    else:
+        tab = d.xpath(
+            f'//*[@resource-id="{pkg}:id/navigation_bar"]/android.view.View/android.view.View[2]')
+        if tab.wait(timeout=3):
             _human_delay(0.3, 0.8)
-            d(resourceId=spotify_ui(pkg, spotify_version, 'search_tab')).click()
+            tab.click()
         else:
-            tab = d.xpath(
-                f'//*[@resource-id="{pkg}:id/navigation_bar"]/android.view.View/android.view.View[2]')
-            if tab.wait(timeout=3):
-                _human_delay(0.3, 0.8)
-                tab.click()
-            else:
-                _human_delay(0.3, 0.6)
-                d.click(405, 1848)
+            _human_delay(0.3, 0.6)
+            d.click(405, 1848)
 
+    _human_delay(1.0, 2.0)
+
+    add_log("INFO", udid, f"[Spotify Human] Clicking search bar...")
+
+    query_field = d(resourceId=spotify_ui(pkg, spotify_version, 'query'))
+    if not query_field.exists(timeout=2):
+        d.click(540, 360)
         _human_delay(1.0, 2.0)
 
-        add_log("INFO", udid, f"[Spotify Human] Clicking search bar...")
-        search_field = _human_locate_search_field()
-        if not search_field:
-            d(textContains="apetece").click_exists(3)
-            _human_delay(1.0, 2.0)
-            search_field = _human_locate_search_field()
-        if not search_field:
-            add_log("WARN", udid, f"[Spotify Human] No search field found after all attempts")
-            d.press("escape")
-            return False
+    query_field = d(resourceId=spotify_ui(pkg, spotify_version, 'query'))
+    edit_field = d(className='android.widget.EditText')
+    search_field = query_field if query_field.exists(timeout=2) else (edit_field if edit_field.exists(timeout=2) else None)
 
-        search_term = (artist_name or '') + ' ' + (album_name or '')
-        add_log("INFO", udid, f"[Spotify Human] Typing: {search_term}")
-        # Type like a human: letter by letter with random pauses (never set_text).
+    if not search_field:
+        d(textContains="apetece").click_exists(3)
+        _human_delay(1.0, 2.0)
+        query_field = d(resourceId=spotify_ui(pkg, spotify_version, 'query'))
+        edit_field = d(className='android.widget.EditText')
+        search_field = query_field if query_field.exists(timeout=2) else (edit_field if edit_field.exists(timeout=2) else None)
+
+    search_term = f"{artist_name} {album_name}"
+    add_log("INFO", udid, f"[Spotify Human] Typing: {search_term}")
+
+    if search_field:
         try:
-            search_field.click()
-            _human_delay(0.4, 0.8)
-            _human_type(udid, search_term)
+            search_field.set_text(search_term)
         except Exception as e:
             if '-32002' in str(e):
                 add_log("WARN", udid, f"[Spotify Human] ATX session lost, reconnecting...")
@@ -5465,53 +5464,46 @@ def _open_spotify_human(d, udid, link, artist_name, album_name, pkg='com.spotify
                 if _newd:
                     d = _newd
                     _human_delay(1.0, 2.0)
-                    sf = _human_locate_search_field()
-                    if sf and sf.exists(timeout=2):
-                        sf.click()
-                        _human_delay(0.4, 0.8)
-                        _human_type(udid, search_term)
+                    rf = d(resourceId=spotify_ui(pkg, spotify_version, 'query'))
+                    ef = d(className='android.widget.EditText')
+                    sf = rf if rf.exists(timeout=2) else ef
+                    if sf.exists(timeout=2):
+                        sf.set_text(search_term)
                 else:
-                    return False
+                    raise
             else:
-                return False
+                raise
+    else:
+        add_log("WARN", udid, f"[Spotify Human] No search field found after all attempts")
+        d.press("escape")
+        return False
 
-        _human_delay(0.6, 1.2)
-        d.press("enter")
-        add_log("INFO", udid, f"[Spotify Human] Search sent, waiting for results...")
+    _human_delay(0.8, 1.5)
+    d.press("enter")
+    add_log("INFO", udid, f"[Spotify Human] Search sent, waiting for results...")
 
-        for i in range(60):
-            if d(resourceId=spotify_ui(pkg, spotify_version, 'search_content_recyclerview')).exists:
-                break
-            if d(resourceId=spotify_ui(pkg, spotify_version, 'search_body')).exists:
-                break
-            if d(resourceId=spotify_ui(pkg, spotify_version, 'no_results_banner_search_root')).exists:
-                break
-            _human_delay(0.08, 0.15)
-
+    for i in range(50):
+        if d(resourceId=spotify_ui(pkg, spotify_version, 'search_content_recyclerview')).exists:
+            break
+        if d(resourceId=spotify_ui(pkg, spotify_version, 'search_body')).exists:
+            break
         if d(resourceId=spotify_ui(pkg, spotify_version, 'no_results_banner_search_root')).exists:
-            add_log("WARN", udid, f"[Spotify Human] No results found - human path failed, fallback needed")
-            return False
+            break
+        time.sleep(0.1)
 
+    if d(resourceId=spotify_ui(pkg, spotify_version, 'no_results_banner_search_root')).exists:
+        add_log("WARN", udid, f"[Spotify Human] No results found, falling back to link intent...")
+        d.shell(f'am start -a android.intent.action.VIEW -d "{link}" {pkg}')
+        _human_delay(4.0, 7.0)
+    else:
         loaded, msg = check_and_click(d, album_name, artist_name, pkg, spotify_version)
         _human_delay(1.5, 3.0)
         if loaded:
             add_log("SUCC", udid, f"[Spotify Human] Found and selected: {artist_name} - {album_name}")
-            return True
-        add_log("WARN", udid, f"[Spotify Human] Search row not found - human path failed, fallback needed")
-        return False
-
-    # Try the human search up to 2 attempts, then deep-link ONLY as final fallback.
-    _human_ok = _human_search_and_open()
-    if not _human_ok:
-        _human_delay(1.0, 2.0)
-        _human_ok = _human_search_and_open()
-    if not _human_ok:
-        add_log("WARN", udid, f"[Spotify Human] 2 human attempts failed; last-resort link intent...")
-        if not str(d.app_current()).lower().__contains__('spotify'):
-            d.app_start(pkg, ".MainActivity")
-        _human_delay(2.0, 3.5)
-        d.shell(f'am start -a android.intent.action.VIEW -d "{link}" {pkg}')
-        _human_delay(4.0, 7.0)
+        else:
+            add_log("WARN", udid, f"[Spotify Human] Search result not found, using intent fallback...")
+            d.shell(f'am start -a android.intent.action.VIEW -d "{link}" {pkg}')
+            _human_delay(4.0, 7.0)
 
     d.implicitly_wait(15)
     for i in range(20):
@@ -5786,118 +5778,26 @@ def _open_tidal_human(d, udid, link, artist_name=None, album_name=None):
 def _open_apple_human(d, udid, link, artist_name=None, album_name=None):
     if _stop_requested(udid):
         return False
-    """Open Apple Music like a person: launch app, go to Search, type
-    artist+album (letter by letter), press enter, choose the album row and
-    play. The deep-link intent is ONLY the last resort after 2 failed searches."""
+    """Open Apple Music via deep link intent, find and tap play. All human-like."""
     _adb_go_home(udid)
-    _human_delay(1.0, 2.5)
-    ensure_screen_on(d)
+    _human_delay(0.5, 1.0)
 
     link_type, slug = _parse_link_info(link)
-    search_term = (' '.join([a for a in (artist_name or '').split()]) + ' ' + (album_name or slug or '')).strip()
 
-    def _apple_search_field():
-        sf = (d(resourceId='com.apple.android.music:id/search_src_text') or
-              d(className='android.widget.AutoCompleteTextView') or
-              d(className='android.widget.EditText'))
-        if sf.exists(timeout=2):
-            return sf
-        tab = (d(description='Buscar') or d(description='Search') or
-               d(resourceId='com.apple.android.music:id/search_tab') or
-               d(textContains='Buscar'))
-        if tab.exists(timeout=3):
-            _human_delay(0.4, 1.0)
-            tab.click()
-            _human_delay(1.5, 3.0)
-        sf = (d(resourceId='com.apple.android.music:id/search_src_text') or
-              d(className='android.widget.AutoCompleteTextView') or
-              d(className='android.widget.EditText'))
-        return sf if sf.exists(timeout=3) else None
+    add_log("INFO", udid, f"[Apple Music Human] Opening {link_type} via intent...")
+    _adb_shell(udid, f'am start -a android.intent.action.VIEW -d "{link}" com.apple.android.music')
+    _human_delay(5.0, 7.0)
+    ensure_screen_on(d)
 
-    def _apple_click_result():
-        # Try album rows first (text contains album name), then any result row.
-        if album_name:
-            for variant in (album_name, album_name.split()[0] if len(album_name.split()) > 1 else album_name):
-                node = d(textContains=variant)
-                if node.exists(timeout=3):
-                    try:
-                        info = node.info
-                        b = info.get('bounds', {})
-                        cy = b.get('top')
-                        if cy > 300:
-                            _human_delay(0.3, 0.8)
-                            node.click()
-                            add_log("SUCC", udid, f"[Apple Music Human] Clicked result '{variant}'")
-                            _human_delay(2.5, 4.5)
-                            return True
-                    except Exception:
-                        pass
-        row = (d(resourceId='com.apple.android.music:id/title') or
-               d(resourceId='com.apple.android.music:id/search_result') or
-               d(className='android.widget.TextView'))
-        if row.exists(timeout=3) and row.count > 0:
-            pick = random.randint(0, min(row.count - 1, 3))
-            _human_delay(0.3, 0.8)
-            row[pick].click()
-            add_log("SUCC", udid, f"[Apple Music Human] Clicked result #{pick+1}")
-            _human_delay(2.5, 4.5)
-            return True
-        return False
+    _dismiss_any_banner(d, udid, 'Apple Music')
+    _human_delay(0.5, 1.2)
 
-    def _apple_human_search_once():
-        nonlocal d
-        if not str(d.app_current()).lower().__contains__('apple'):
-            # Real main activity of Apple Music Android is SplashActivity, NOT
-            # .MainActivity. Launching .MainActivity crashes the app instantly.
-            _adb_go_home(udid)
-            _human_delay(0.8, 1.6)
-            try:
-                d.app_start('com.apple.android.music', '.onboarding.activities.SplashActivity')
-            except Exception:
-                _adb_shell(udid, 'monkey -p com.apple.android.music -c android.intent.category.LAUNCHER 1')
-        _human_delay(2.5, 4.5)
-        _dismiss_any_banner(d, udid, 'Apple Music')
-        _human_delay(0.6, 1.2)
-        sf = _apple_search_field()
-        if not sf:
-            add_log("WARN", udid, "[Apple Music Human] No search field found")
-            return False
-        sf.click()
-        _human_delay(0.4, 0.9)
-        try:
-            _human_type(udid, search_term)
-        except Exception as e:
-            if '-32002' in str(e):
-                _newd = _atx_reconnect(udid)
-                if _newd:
-                    d = _newd
-                    _human_delay(1.0, 2.0)
-                    sf2 = _apple_search_field()
-                    if sf2 and sf2.exists(timeout=2):
-                        sf2.click()
-                        _human_delay(0.4, 0.9)
-                        _human_type(udid, search_term)
-                else:
-                    return False
-            else:
-                return False
-        _human_delay(1.0, 1.8)
-        _adb_shell(udid, 'input keyevent 66')
-        add_log("INFO", udid, f"[Apple Music Human] Searching: {search_term}")
-        _human_delay(4.0, 6.0)
-        return _apple_click_result()
-
-    _ok = _apple_human_search_once()
-    if not _ok:
-        _human_delay(1.0, 2.0)
-        _ok = _apple_human_search_once()
-    if not _ok:
-        add_log("WARN", udid, "[Apple Music Human] 2 human searches failed; last-resort link intent")
-        _adb_shell(udid, f'am start -a android.intent.action.VIEW -d "{link}" com.apple.android.music')
-        _human_delay(4.5, 6.5)
-        ensure_screen_on(d)
-        _dismiss_any_banner(d, udid, 'Apple Music')
-        _human_delay(0.6, 1.2)
+    # For albums/playlists, scroll down a bit to show track listing
+    if link_type in ('Album', 'Playlist'):
+        _human_delay(0.5, 1.0)
+        for _ in range(random.randint(1, 2)):
+            d.swipe(540, 1400, 540, 800, duration=random.uniform(0.4, 0.7))
+            _human_delay(0.8, 1.5)
 
     play_btn = (d(resourceId='com.apple.android.music:id/button_play') or
                 d(description='Reproducir') or d(description='Play') or
@@ -5906,7 +5806,6 @@ def _open_apple_human(d, udid, link, artist_name=None, album_name=None):
         info = play_btn.info
         desc = str(info.get('contentDescription', '') or '')
         if 'Pause' in desc or 'Pausar' in desc:
-            _human_delay(0.5, 1.0)
             add_log("INFO", udid, f"[Apple Music Human] Already playing")
             return True
         pb = info.get('bounds', {})
@@ -5917,17 +5816,12 @@ def _open_apple_human(d, udid, link, artist_name=None, album_name=None):
         _human_delay(1.0, 2.0)
         return True
 
-    # Tracks might be listed: tap the first song row (human way to start an album)
-    track_row = (d(resourceId='com.apple.android.music:id/track_row') or
-                 d(resourceId='com.apple.android.music:id/item_root') or
-                 d(resourceId='com.apple.android.music:id/track_list') or
-                 d(resourceId='com.apple.android.music:id/row'))
-    if track_row.exists(timeout=3):
-        track_row.click()
-        _human_delay(1.0, 2.0)
-        add_log("SUCC", udid, f"[Apple Music Human] Tapped first track")
+    mini_pause = d(descriptionContains='Pause') or d(descriptionContains='Pausar')
+    if mini_pause.exists(timeout=3):
+        add_log("INFO", udid, f"[Apple Music Human] Already playing (pause visible)")
         return True
 
+    # Fallback: try mini player play button
     mini_play = d(resourceId='com.apple.android.music:id/mini_player_play')
     if mini_play.exists(timeout=3):
         bi = mini_play.info['bounds']
@@ -5938,8 +5832,9 @@ def _open_apple_human(d, udid, link, artist_name=None, album_name=None):
         _human_delay(1.0, 2.0)
         return True
 
-    add_log("INFO", udid, f"[Apple Music Human] Waiting for app-level play")
-    _human_delay(2.0, 4.0)
+    _adb_media_next(udid)
+    _human_delay(1.0, 2.0)
+    add_log("SUCC", udid, f"[Apple Music Human] {link_type} opened via intent, NEXT sent")
     return True
 
 
@@ -6476,56 +6371,23 @@ def _send_proxy_alert(udid, proxy, message):
 
 
 def _is_vpn_active(udid):
-    # En estos dispositivos `dumpsys vpn` NO existe ("Can't find service: vpn").
-    # La fuente fiable es `dumpsys connectivity`, que muestra el bloque VPN real
-    # cuando hay un VPN activo: "VPN CONNECTED" + OwnerUid=session_id del
-    # servidor proxy + OwnerUid=UID del paquete que lo creo.
-    #
-    # OJO: NO se puede usar 'com.scheler.superproxy' + 'connected' como check
-    # porque el paquete SIEMPRE aparece en NetworkRequest (el paquete esta
-    # instalado) y 'connected' aparece en "WIFI CONNECTED" — ambos son True
-    # aunque NO haya VPN activo, causando un falso positivo constante.
-    #
-    # El UNICO check fiable es: "vpn connected" en el output + que el
-    # OwnerUid del bloque VPN coincida con el UID real de Super Proxy.
     try:
-        uid = None
-        try:
-            pu = subprocess.run(
-                [adb_path, '-s', udid, 'shell', 'dumpsys', 'package', 'com.scheler.superproxy'],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10, startupinfo=startupinfo
-            )
-            m = re.search(r'userId=(\d+)', pu.stdout)
-            if m:
-                uid = m.group(1)
-        except:
-            uid = None
-
-        for service in (['dumpsys', 'connectivity'], ['dumpsys', 'vpn']):
-            try:
-                result = subprocess.run(
-                    [adb_path, '-s', udid, 'shell'] + service,
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10, startupinfo=startupinfo
-                )
-                output = result.stdout.lower()
-                if not output:
-                    continue
-                if 'vpn connected' in output and uid and f'owneruid: {uid}' in output:
-                    return True
-            except:
-                continue
+        result = subprocess.run(
+            [adb_path, '-s', udid, 'shell', 'dumpsys', 'vpn'],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10, startupinfo=startupinfo
+        )
+        output = result.stdout.lower()
+        if 'com.scheler.superproxy' in output and ('connected' in output or 'established' in output):
+            return True
+        if 'active vpn' in output and 'com.scheler.superproxy' in output:
+            return True
         return False
     except:
         return False
 
 
 def _open_super_proxy(udid):
-    # Si la app ya esta al frente, no relanzar ni esperar (para no frenar bucles
-    # de polling que llaman a _check_super_proxy_ui cada pocos segundos).
     try:
-        _wake_screen_via_adb(udid)
-        if _is_super_proxy_foreground(udid):
-            return True
         subprocess.run(
             [adb_path, '-s', udid, 'shell', 'am', 'start', '-n', SUPER_PROXY_ACTIVITY],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10, startupinfo=startupinfo
@@ -6534,21 +6396,6 @@ def _open_super_proxy(udid):
         return True
     except:
         return False
-
-
-def _wake_screen_via_adb(udid):
-    """Despierta pantalla y quita el keyguard sin depender de uiautomator.
-    Critico para ciclos de 24h: si la pantalla se apago, uiautomator/screencap
-    fallan y el proxy quedaria bloqueado sin motivo real."""
-    try:
-        subprocess.run([adb_path, '-s', udid, 'shell', 'svc', 'power', 'stayon', 'true'],
-                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5, startupinfo=startupinfo)
-        subprocess.run([adb_path, '-s', udid, 'shell', 'input', 'keyevent', 'KEYCODE_WAKEUP'],
-                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5, startupinfo=startupinfo)
-        subprocess.run([adb_path, '-s', udid, 'shell', 'wm', 'dismiss-keyguard'],
-                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5, startupinfo=startupinfo)
-    except:
-        pass
 
 
 def _dump_super_proxy_ui(udid):
@@ -6793,183 +6640,98 @@ def _is_super_proxy_list_view(udid):
     return False
 
 
-def _ensure_super_proxy_detail(udid, xml=None):
-    """Asegura estar en el detail view de Super Proxy y devuelve algo truthy si hay
-    boton Start/Stop. Estrategia VISION-FIRST: en telefonos Samsung reales la app
-    Flutter no expone la tarjeta al uiautomator (dump sin content-desc), asi que:
-    1) se detecta el boton de color a pantalla completa por screenshot;
-    2) si no, se toca la tarjeta del proxy para entrar al detalle (por XML o por banda
-       blanca visual) y se re-chequea el color hasta 3 intentos."""
-    import re
-    if xml and _find_ui_button(xml, ['Stop', 'Running', 'Disconnect', 'Start', 'Connect']):
-        return xml
-    color, cx, cy = _screencap_color_check(udid)
-    if color in ('disconnected', 'connected'):
-        add_log("INFO", udid, f"[Proxy] Detail view detectado por vision (color={color}) sin depender del XML.")
-        return f"<detail-view color='{color}'/>"
-    proxy_card = re.compile(
-        r'content-desc="(?:Proxy )?(\d+)[^"]*"[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"',
-        re.IGNORECASE)
-    for attempt in range(3):
-        card = None
-        label = ''
-        if xml:
-            m = proxy_card.search(xml)
-            if m:
-                x1, y1, x2, y2 = int(m.group(2)), int(m.group(3)), int(m.group(4)), int(m.group(5))
-                card = (x2 - 80, (y1 + y2) // 2)
-                label = m.group(1)
-        if card is None:
-            if _is_super_proxy_foreground(udid):
-                pos = _find_proxy_card_pos(udid)
-                if pos:
-                    card = pos
-                    label = 'visual'
-        if not card:
-            break
-        add_log("INFO", udid, f"[Proxy] Tocando tarjeta del proxy ({label}) en ({card[0]},{card[1]}) attempt {attempt+1}...")
+def _ensure_super_proxy_detail(udid):
+    """Si está en la vista de inicio/lista, toca la tarjeta del proxy para entrar al detalle.
+    Devuelve True si logró llegar a una vista con botón o si nunca estuvo en lista."""
+    if not _is_super_proxy_list_view(udid):
+        return True
+    card = _find_proxy_card_pos(udid)
+    if card:
         subprocess.run(
             [adb_path, '-s', udid, 'shell', 'input', 'tap', str(card[0]), str(card[1])],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5, startupinfo=startupinfo
         )
-        time.sleep(4)
-        color, cx, cy = _screencap_color_check(udid)
-        if color in ('disconnected', 'connected'):
-            add_log("INFO", udid, f"[Proxy] Attempt {attempt+1}: detail view alcanzado (color={color}).")
-            return f"<detail-view color='{color}'/>"
-        add_log("WARN", udid, f"[Proxy] Attempt {attempt+1}: aun sin boton de color; reintentando...")
-        time.sleep(1)
-        if xml:
-            xml = _dump_super_proxy_ui(udid) or xml
-    return None
-
-
-def _screencap_color_check(udid):
-    """Take a screenshot and scan the FULL screen for colored toggle button.
-    Flutter/uiautomator bounds are unreliable; we find the button visually.
-    Returns ('disconnected', x, y) if green/blue (Start),
-    ('connected', x, y) if red/orange (Stop),
-    ('neutral', x, y) if no colored button (connected),
-    ('unknown', 0, 0) if cannot determine."""
-    try:
-        import tempfile, os
-        from PIL import Image
-        remote = '/data/local/tmp/_sp_sc.png'
-        local = os.path.join(tempfile.gettempdir(), '_sp_sc.png')
-        subprocess.run(
-            [adb_path, '-s', udid, 'shell', 'screencap', '-p', remote],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10, startupinfo=startupinfo
-        )
-        subprocess.run(
-            [adb_path, '-s', udid, 'pull', remote, local],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10, startupinfo=startupinfo
-        )
-        if not os.path.exists(local):
-            return ('unknown', 0, 0)
-        img = Image.open(local)
-        w, h = img.size
-        disconnected_xs = []
-        disconnected_ys = []
-        connected_xs = []
-        connected_ys = []
-        neutral_count = 0
-        green_count = 0
-        red_count = 0
-        for y in range(240, h - 60, 8):
-            for x in range(40, w - 40, 20):
-                r, g, b = img.getpixel((x, y))[:3]
-                mx = max(r, g, b)
-                mn = min(r, g, b)
-                if mx - mn > 40 and mx > 80:
-                    if g > r + 20 and g > b + 10:
-                        green_count += 1
-                        disconnected_xs.append(x)
-                        disconnected_ys.append(y)
-                    elif r > g + 20 and r > b + 20:
-                        red_count += 1
-                        connected_xs.append(x)
-                        connected_ys.append(y)
-                    else:
-                        green_count += 1
-                        disconnected_xs.append(x)
-                        disconnected_ys.append(y)
-                elif mx > 50:
-                    neutral_count += 1
-        total = green_count + red_count + neutral_count
-        if total == 0:
-            return ('unknown', 0, 0)
-        add_log("INFO", udid, f"[Proxy] Color check: green={green_count} red={red_count} neutral={neutral_count}")
-        min_span = int(w * 0.45)
-        if disconnected_xs:
-            xs = sorted(disconnected_xs)
-            span = xs[-1] - xs[0]
-            if green_count > red_count * 2 and green_count >= 20 and span > min_span:
-                tap_x = disconnected_xs[len(disconnected_xs) // 2]
-                tap_y = disconnected_ys[len(disconnected_ys) // 2]
-                add_log("INFO", udid, f"[Proxy] GREEN wide button detected span={span}px -> disconnected at ({tap_x},{tap_y})")
-                return ('disconnected', tap_x, tap_y)
-        if connected_xs:
-            xs = sorted(connected_xs)
-            span = xs[-1] - xs[0]
-            if red_count > green_count * 2 and red_count >= 20 and span > min_span:
-                tap_x = connected_xs[len(connected_xs) // 2]
-                tap_y = connected_ys[len(connected_ys) // 2]
-                add_log("INFO", udid, f"[Proxy] RED wide button detected span={span}px -> connected at ({tap_x},{tap_y})")
-                return ('connected', tap_x, tap_y)
-        return ('neutral', 0, 0)
-    except Exception as e:
-        add_log("WARN", udid, f"[Proxy] Color check failed: {e}")
-        return ('unknown', 0, 0)
-
-
-def _check_super_proxy_ui(udid):
-    _open_super_proxy(udid)
-    time.sleep(1)
-    xml = _dump_super_proxy_ui(udid)
-    xml = _ensure_super_proxy_detail(udid, xml)
-    if not xml:
-        add_log("WARN", udid, "[Proxy] Could not reach detail view; skipping color check.")
-        return False
-    time.sleep(1)
-    color, cx, cy = _screencap_color_check(udid)
-    if color == 'neutral' or color == 'connected':
+        add_log("INFO", udid, f"[Proxy] In Super Proxy home/list view. Tapped proxy card at {card} to open detail...")
+        time.sleep(3)
         return True
     return False
 
 
-def _wait_proxy_connected(udid, max_wait=35, interval=5):
-    waited = 0
-    while waited < max_wait:
-        if _stop_requested(udid):
+def _check_super_proxy_ui(udid):
+    if _is_super_proxy_foreground(udid):
+        color, pos = _screenshot_button_color(udid)
+        if color == 'green':
             return False
-        if _check_super_proxy_ui(udid):
+        if color == 'red':
             return True
-        time.sleep(interval)
-        waited += interval
+        if not color:
+            return False
+    xml = _dump_super_proxy_ui(udid)
+    if xml and _find_ui_button(xml, ['Stop', 'Running', 'Disconnect']):
+        return True
+    if xml and (_find_ui_button(xml, ['Start', 'Connect'])):
+        return False
     return False
 
 
 def _tap_super_proxy_start(udid):
-    _open_super_proxy(udid)
-    time.sleep(1)
-    xml = _dump_super_proxy_ui(udid)
-    xml = _ensure_super_proxy_detail(udid, xml)
-    if not xml:
-        add_log("WARN", udid, "[Proxy] Could not reach detail view; not touching toggle.")
-        return False
-    time.sleep(1)
-    color, tap_x, tap_y = _screencap_color_check(udid)
-    if color == 'neutral' or color == 'connected':
-        add_log("INFO", udid, f"[Proxy] Color={color.upper()} (already active) - does NOT touch toggle.")
-        return False
-    if color == 'disconnected' and tap_x > 0 and tap_y > 0:
+    _ensure_super_proxy_detail(udid)
+    color, pos = _screenshot_button_color(udid)
+    if color == 'green' and pos:
         subprocess.run(
-            [adb_path, '-s', udid, 'shell', 'input', 'tap', str(tap_x), str(tap_y)],
+            [adb_path, '-s', udid, 'shell', 'input', 'tap', str(pos[0]), str(pos[1])],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5, startupinfo=startupinfo
         )
-        add_log("INFO", udid, f"[Proxy] Color=GREEN (disconnected) + tapped toggle at ({tap_x},{tap_y}) to CONNECT.")
         return True
-    add_log("WARN", udid, "[Proxy] Could not determine proxy state; not touching toggle.")
+    if color == 'red' and pos:
+        return True
+
+    card = _find_proxy_card_pos(udid)
+    if card:
+        subprocess.run(
+            [adb_path, '-s', udid, 'shell', 'input', 'tap', str(card[0]), str(card[1])],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5, startupinfo=startupinfo
+        )
+        time.sleep(3)
+        color, pos = _screenshot_button_color(udid)
+        if color == 'green' and pos:
+            subprocess.run(
+                [adb_path, '-s', udid, 'shell', 'input', 'tap', str(pos[0]), str(pos[1])],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5, startupinfo=startupinfo
+            )
+            return True
+        if color == 'red' and pos:
+            return True
+
+    xml = _dump_super_proxy_ui(udid)
+    if xml:
+        target = _find_ui_button(xml, ['Start', 'Connect'])
+        if not target:
+            proxy_card = _find_ui_text(xml, ['Proxy'], exclude=['Super Proxy', 'Add proxy', 'Proxies'])
+            if proxy_card:
+                subprocess.run(
+                    [adb_path, '-s', udid, 'shell', 'input', 'tap', str(proxy_card[0]), str(proxy_card[1])],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5, startupinfo=startupinfo
+                )
+                time.sleep(3)
+                color, pos = _screenshot_button_color(udid)
+                if color == 'green' and pos:
+                    subprocess.run(
+                        [adb_path, '-s', udid, 'shell', 'input', 'tap', str(pos[0]), str(pos[1])],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5, startupinfo=startupinfo
+                    )
+                    return True
+                if color == 'red' and pos:
+                    return True
+                xml = _dump_super_proxy_ui(udid)
+                if xml:
+                    target = _find_ui_button(xml, ['Start', 'Connect'])
+        if target:
+            subprocess.run(
+                [adb_path, '-s', udid, 'shell', 'input', 'tap', str(target[0]), str(target[1])],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5, startupinfo=startupinfo
+            )
+            return True
     return False
 
 
@@ -6992,44 +6754,34 @@ def _validate_device_proxy(udid, proxy, connection_type):
             time.sleep(2)
             continue
         add_log("WARN", udid, f"[Proxy] VALIDATION {vround}/4: NOT connected, attempting to start...")
-        # Toca SOLO el boton START real (verde) via content-desc (nunca el STOP/rojo).
-        # IMPORTANTE: un solo tap y esperar PACIENTE (hasta 40s). No percutar de
-        # forma agresiva: cada re-tap cancela la conexion en curso del proxy y esta
-        # nunca llega a establecerse (sobre todo cuando 15 telos conectan a la vez).
         rectified = False
-        for attempt in range(1, 3):
+        for attempt in range(1, 6):
             if _stop_requested(udid):
                 return False
             _open_super_proxy(udid)
+            time.sleep(1)
+            _tap_super_proxy_start(udid)
+            time.sleep(5)
+            if _check_super_proxy_ui(udid):
+                connected_rounds += 1
+                add_log("SUCC", udid, f"[Proxy] RECTIFIED on attempt {attempt} (round {vround}/4, {connected_rounds}/4 rounds ok)")
+                rectified = True
+                time.sleep(2)
+                break
+            add_log("WARN", udid, f"[Proxy] Rectify attempt {attempt}/5 (round {vround}/4) failed, retrying...")
             time.sleep(2)
-            if _tap_super_proxy_start(udid):
-                # Espera larga y paciente (40s) para que el proxy establezca.
-                if _wait_proxy_connected(udid, max_wait=40, interval=5):
-                    connected_rounds += 1
-                    add_log("SUCC", udid, f"[Proxy] RECTIFIED on attempt {attempt} (round {vround}/4, {connected_rounds}/4 rounds ok)")
-                    rectified = True
-                    time.sleep(2)
-                    break
-            add_log("WARN", udid, f"[Proxy] Rectify attempt {attempt}/2 (round {vround}/4) could not connect; one more try.")
-            time.sleep(3)
         if not rectified:
-            add_log("WARN", udid, f"[Proxy] Round {vround}/4 could NOT connect; continuing to next round.")
+            msg = f"Super Proxy FAILED the {vround}/4 validation round (could NOT connect within 5 attempts) on device {udid}. Device will be skipped."
+            _send_proxy_alert(udid, proxy, msg)
+            proxy_blocked_devices.add(udid)
+            add_log("ERR.", udid, "[Proxy] Validation failed. Skipping device.")
+            return False
 
-    if connected_rounds >= 3:
+    if connected_rounds >= 4:
         add_log("SUCC", udid, f"[Proxy] Validated CONNECTED in {connected_rounds}/4 rounds. Proceeding to launch apps.")
-        if udid in proxy_blocked_devices:
-            proxy_blocked_devices.discard(udid)
         return True
     add_log("ERR.", udid, f"[Proxy] Only {connected_rounds}/4 rounds connected. Failing validation.")
     proxy_blocked_devices.add(udid)
-    msg = f"Proxy NO conecto tras 4 rondas en {udid}. Celular detenido; se reintentara en la siguiente ronda."
-    _send_proxy_alert(udid, proxy, msg)
-    for pkg in ['com.spotify.music', 'com.aspiro.tidal', 'com.apple.android.music']:
-        try:
-            subprocess.run([adb_path, '-s', udid, 'shell', 'am', 'force-stop', pkg],
-                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5, startupinfo=startupinfo)
-        except:
-            pass
     return False
 
 
@@ -7041,14 +6793,21 @@ def _recheck_device_proxy(udid, proxy, connection_type):
             add_log("SUCC", udid, f"[Proxy] RECHECK {rcheck_round}/2: CONNECTED")
             return True
         add_log("WARN", udid, f"[Proxy] RECHECK {rcheck_round}/2: NOT connected, attempting to start...")
-        _open_super_proxy(udid)
-        time.sleep(1)
-        _tap_super_proxy_start(udid)
-        if _wait_proxy_connected(udid, max_wait=30, interval=5):
-            add_log("SUCC", udid, "[Proxy] RECHECK reconnected (proxy came back to RED)")
+        rectified = False
+        for attempt in range(1, 6):
+            _open_super_proxy(udid)
+            time.sleep(1)
+            _tap_super_proxy_start(udid)
+            time.sleep(5)
+            if _check_super_proxy_ui(udid):
+                add_log("SUCC", udid, f"[Proxy] RECHECK reconnected on attempt {attempt} (round {rcheck_round}/2)")
+                rectified = True
+                break
+            add_log("WARN", udid, f"[Proxy] Recheck attempt {attempt}/5 (round {rcheck_round}/2) failed, retrying...")
+            time.sleep(2)
+        if rectified:
             return True
-        add_log("WARN", udid, "[Proxy] Recheck could not reconnect within wait window.")
-    msg = f"Super Proxy DISCONNECTED and failed to reconnect after 2 rounds on device {udid}. Device stopped."
+    msg = f"Super Proxy DISCONNECTED and failed to reconnect after 2 rounds (5 attempts each) on device {udid}. Device stopped."
     _send_proxy_alert(udid, proxy, msg)
     proxy_blocked_devices.add(udid)
     apps_to_close = ['com.spotify.music', 'com.aspiro.tidal', 'com.apple.android.music']
@@ -7391,11 +7150,7 @@ def _multi_app_monitor_all(selected_apps_keys, udid, session_time_seconds, binde
                         add_log("INFO", udid, f"[MultiApp] [{display_name}] Still not PLAYING; sent NEXT...")
                         time.sleep(6)
                         _np_state, _np_title, _np_artist = _get_now_playing(udid, pkg)
-                # Multi Sound sessions often report BUFFERING/PAUSED for a moment
-                # during track changes even though audio keeps playing. Only count
-                # if the session has metadata (title) and state is PLAYING/BUFFERING/PAUSED.
-                _countable = _np_state == 'PLAYING' or (_np_state in ('BUFFERING', 'PAUSED') and _np_title)
-                if not _countable:
+                if _np_state != 'PLAYING':
                     add_log("WARN", udid, f"[MultiApp] [{display_name}] Not PLAYING ({_np_state}) at end of playtime; not counting stream.")
                     app_timers[app_key] = now
                     app_next_action_time[app_key] = now + random.uniform(15, 35)
@@ -7438,17 +7193,11 @@ def _multi_app_monitor_all(selected_apps_keys, udid, session_time_seconds, binde
                         new_songs = random.randint(8, 25)
                         app_relink_counters[app_key] = new_songs
                         app_total_songs_in_link[app_key] = new_songs
+                elif app_key == 'spotify':
+                    _adb_media_next(udid)
+                    add_log("INFO", udid, f"[MultiApp] [Spotify] NEXT via ADB media")
                 else:
-                    # Human UI next for every app (Spotify, Tidal, Apple): open the
-                    # app briefly, tap the visible Next, never raw media dispatch.
-                    try:
-                        _multi_app_next_song(udid, app_key, pkg, display_name)
-                    except Exception as _nxe:
-                        add_log("WARN", udid, f"[MultiApp] [{display_name}] UI NEXT failed ({_nxe}); media NEXT fallback")
-                        if app_key == 'spotify':
-                            _adb_media_next(udid)
-                        else:
-                            _adb_media_next(udid)
+                    _multi_app_next_song(udid, app_key, pkg, display_name)
 
                 app_next_action_time[app_key] = now + random.uniform(15, 35)
 
@@ -7481,66 +7230,40 @@ def _multi_app_monitor_all(selected_apps_keys, udid, session_time_seconds, binde
                 pkg = SUPPORTED_APPS[app_key]['package']
                 dn = SUPPORTED_APPS[app_key]['display_name']
                 state, title, artist = _get_now_playing(udid, pkg)
-                if state in ('PLAYING', 'PLAYING_STALE'):
-                    if state == 'PLAYING':
-                        if app_forcestop_count.get(app_key, 0) > 0 and (now2 - app_last_forcestop_time.get(app_key, 0)) > 300:
-                            app_forcestop_count[app_key] = 0
-                        app_last_good_time[app_key] = now2
-                        app_consecutive_bad[app_key] = 0
-                        is_recommendation = False
-                        if title:
-                            combined = f"{title} {artist}".lower()
-                            if any(kw in combined for kw in ['recomendaci', 'recommended', 'para ti', 'for you', 'radio', 'my mix', 'daily mix', 'discover weekly', 'release radar', 'mix de']):
-                                is_recommendation = True
-                            status_parts.append(f"{dn}: '{title}' by {artist}")
-                        else:
-                            status_parts.append(f"{dn}: PLAYING (no title)")
-                        if is_recommendation:
-                            add_log("WARN", udid, f"[MultiApp] [{dn}] Playing recommendations instead of link. Forcing relink...")
-                            try:
-                                ui_lock = _get_device_ui_lock(udid)
-                                ui_lock.acquire()
-                                try:
-                                    _multi_app_relaunch_after_link(udid, app_key, pkg, dn)
-                                    link_info_new = getattr(_multi_app_relink_app, '_link_info', {})
-                                    if app_key in link_info_new:
-                                        info = link_info_new[app_key]
-                                        app_relink_counters[app_key] = info.get('remaining', random.randint(8, 25))
-                                        app_total_songs_in_link[app_key] = info.get('total_songs', app_relink_counters[app_key])
-                                        app_link_types[app_key] = info.get('type', 'Unknown')
-                                    app_consecutive_bad[app_key] = 0
-                                    app_last_good_time[app_key] = time.time()
-                                    add_log("SUCC", udid, f"[MultiApp] [{dn}] Relinked from recommendations to fresh link")
-                                finally:
-                                    ui_lock.release()
-                            except Exception as e:
-                                add_log("ERR.", udid, f"[MultiApp] [{dn}] Recommendation relink failed: {e}")
+                if state == 'PLAYING':
+                    if app_forcestop_count.get(app_key, 0) > 0 and (now2 - app_last_forcestop_time.get(app_key, 0)) > 300:
+                        app_forcestop_count[app_key] = 0
+                    app_last_good_time[app_key] = now2
+                    app_consecutive_bad[app_key] = 0
+                    is_recommendation = False
+                    if title:
+                        combined = f"{title} {artist}".lower()
+                        if any(kw in combined for kw in ['recomendaci', 'recommended', 'para ti', 'for you', 'radio', 'my mix', 'daily mix', 'discover weekly', 'release radar', 'mix de']):
+                            is_recommendation = True
+                        status_parts.append(f"{dn}: '{title}' by {artist}")
                     else:
-                        # PLAYING but audio frozen: media PLAY nudge then re-check.
-                        app_consecutive_bad[app_key] = app_consecutive_bad.get(app_key, 0) + 1
-                        status_parts.append(f"{dn}: PLAYING_STALE ({app_consecutive_bad[app_key]}x)")
-                        if app_consecutive_bad[app_key] >= 2:
-                            add_log("WARN", udid, f"[MultiApp] [{dn}] PLAYING but audio not advancing. Soft recovery (media PLAY)...")
+                        status_parts.append(f"{dn}: PLAYING (no title)")
+                    if is_recommendation:
+                        add_log("WARN", udid, f"[MultiApp] [{dn}] Playing recommendations instead of link. Forcing relink...")
+                        try:
+                            ui_lock = _get_device_ui_lock(udid)
+                            ui_lock.acquire()
                             try:
-                                _adb_media_play(udid)
-                                time.sleep(5)
-                                st2, _t2, _a2 = _get_now_playing(udid, pkg)
-                                if st2 == 'PLAYING':
-                                    app_consecutive_bad[app_key] = 0
-                                    app_last_good_time[app_key] = time.time()
-                                    add_log("SUCC", udid, f"[MultiApp] [{dn}] PLAYING_STALE fixed after media PLAY")
-                                else:
-                                    _adb_media_next(udid)
-                                    time.sleep(6)
-                                    st3, _t3, _a3 = _get_now_playing(udid, pkg)
-                                    if st3 == 'PLAYING':
-                                        app_consecutive_bad[app_key] = 0
-                                        app_last_good_time[app_key] = time.time()
-                                        app_timers[app_key] = time.time()
-                                        add_log("SUCC", udid, f"[MultiApp] [{dn}] PLAYING_STALE fixed after NEXT")
-                            except Exception as e:
-                                add_log("ERR.", udid, f"[MultiApp] [{dn}] PLAYING_STALE recover error: {e}")
-                elif state in ('BUFFERING', 'BUFFERING_STALE'):
+                                _multi_app_relaunch_after_link(udid, app_key, pkg, dn)
+                                link_info_new = getattr(_multi_app_relink_app, '_link_info', {})
+                                if app_key in link_info_new:
+                                    info = link_info_new[app_key]
+                                    app_relink_counters[app_key] = info.get('remaining', random.randint(8, 25))
+                                    app_total_songs_in_link[app_key] = info.get('total_songs', app_relink_counters[app_key])
+                                    app_link_types[app_key] = info.get('type', 'Unknown')
+                                app_consecutive_bad[app_key] = 0
+                                app_last_good_time[app_key] = time.time()
+                                add_log("SUCC", udid, f"[MultiApp] [{dn}] Relinked from recommendations to fresh link")
+                            finally:
+                                ui_lock.release()
+                        except Exception as e:
+                            add_log("ERR.", udid, f"[MultiApp] [{dn}] Recommendation relink failed: {e}")
+                elif state == 'BUFFERING':
                     seconds_stuck = now2 - app_last_good_time.get(app_key, now2)
                     if seconds_stuck > 30:
                         app_consecutive_bad[app_key] = app_consecutive_bad.get(app_key, 0) + 1
@@ -7551,55 +7274,31 @@ def _multi_app_monitor_all(selected_apps_keys, udid, session_time_seconds, binde
                             if fs_count >= 3 and (now2 - fs_last) < 300:
                                 add_log("WARN", udid, f"[MultiApp] [{dn}] BUFFERING stuck but force-stop cooldown active ({fs_count}x in 5min). Skipping recovery.")
                             else:
-                                add_log("WARN", udid, f"[MultiApp] [{dn}] BUFFERING stuck for {int(seconds_stuck)}s. Soft recovery first (media PLAY)...")
+                                add_log("WARN", udid, f"[MultiApp] [{dn}] BUFFERING stuck for {int(seconds_stuck)}s. Force-stop + relaunch...")
                                 app_forcestop_count[app_key] = fs_count + 1
                                 app_last_forcestop_time[app_key] = now2
-                                # SOFT: try media PLAY + NEXT before killing the app.
-                                _stB = 'BUFFERING_STALE'
                                 try:
-                                    _adb_media_play(udid)
-                                    time.sleep(5)
-                                    _stB, _tB, _aB = _get_now_playing(udid, pkg)
-                                    if _stB == 'PLAYING':
-                                        app_consecutive_bad[app_key] = 0
-                                        app_last_good_time[app_key] = time.time()
-                                        add_log("SUCC", udid, f"[MultiApp] [{dn}] BUFFERING fixed via media PLAY")
-                                        continue
-                                    _adb_media_next(udid)
-                                    time.sleep(6)
-                                    _stB, _tB, _aB = _get_now_playing(udid, pkg)
-                                    if _stB == 'PLAYING':
-                                        app_consecutive_bad[app_key] = 0
-                                        app_last_good_time[app_key] = time.time()
-                                        app_timers[app_key] = time.time()
-                                        add_log("SUCC", udid, f"[MultiApp] [{dn}] BUFFERING fixed via NEXT")
-                                        continue
-                                except Exception as e:
-                                    add_log("ERR.", udid, f"[MultiApp] [{dn}] BUFFERING soft recover error: {e}")
-                                # Hard only if STILL not playing after soft attempts.
-                                if _stB in ('STOPPED', 'PAUSED', 'ERROR', 'BUFFERING_STALE', 'BUFFERING'):
+                                    ui_lock = _get_device_ui_lock(udid)
+                                    ui_lock.acquire()
                                     try:
-                                        ui_lock = _get_device_ui_lock(udid)
-                                        ui_lock.acquire()
-                                        try:
-                                            _ensure_volume_max(udid)
-                                            _adb_shell(udid, f'am force-stop {pkg}')
-                                            time.sleep(2)
-                                            _enable_multi_audio_focus(udid)
-                                            _multi_app_relaunch_after_link(udid, app_key, pkg, dn)
-                                            link_info_new = getattr(_multi_app_relink_app, '_link_info', {})
-                                            if app_key in link_info_new:
-                                                info = link_info_new[app_key]
-                                                app_relink_counters[app_key] = info.get('remaining', random.randint(8, 25))
-                                                app_total_songs_in_link[app_key] = info.get('total_songs', app_relink_counters[app_key])
-                                                app_link_types[app_key] = info.get('type', 'Unknown')
-                                            app_consecutive_bad[app_key] = 0
-                                            app_last_good_time[app_key] = time.time()
-                                            add_log("SUCC", udid, f"[MultiApp] [{dn}] Recovery complete after BUFFERING stuck")
-                                        finally:
-                                            ui_lock.release()
-                                    except Exception as e:
-                                        add_log("ERR.", udid, f"[MultiApp] [{dn}] Recovery failed: {e}")
+                                        _ensure_volume_max(udid)
+                                        _adb_shell(udid, f'am force-stop {pkg}')
+                                        time.sleep(2)
+                                        _enable_multi_audio_focus(udid)
+                                        _multi_app_relaunch_after_link(udid, app_key, pkg, dn)
+                                        link_info_new = getattr(_multi_app_relink_app, '_link_info', {})
+                                        if app_key in link_info_new:
+                                            info = link_info_new[app_key]
+                                            app_relink_counters[app_key] = info.get('remaining', random.randint(8, 25))
+                                            app_total_songs_in_link[app_key] = info.get('total_songs', app_relink_counters[app_key])
+                                            app_link_types[app_key] = info.get('type', 'Unknown')
+                                        app_consecutive_bad[app_key] = 0
+                                        app_last_good_time[app_key] = time.time()
+                                        add_log("SUCC", udid, f"[MultiApp] [{dn}] Recovery complete after BUFFERING stuck")
+                                    finally:
+                                        ui_lock.release()
+                                except Exception as e:
+                                    add_log("ERR.", udid, f"[MultiApp] [{dn}] Recovery failed: {e}")
                         elif app_consecutive_bad[app_key] == 1:
                             add_log("WARN", udid, f"[MultiApp] [{dn}] BUFFERING stuck for {int(seconds_stuck)}s. Sending NEXT...")
                             try:
@@ -7653,48 +7352,31 @@ def _multi_app_monitor_all(selected_apps_keys, udid, session_time_seconds, binde
                             if fs_count >= 3 and (now2 - fs_last) < 300:
                                 add_log("WARN", udid, f"[MultiApp] [{dn}] unknown but force-stop cooldown active ({fs_count}x in 5min). Skipping recovery.")
                             else:
-                                add_log("WARN", udid, f"[MultiApp] [{dn}] unknown for {int(seconds_since_good)}s. Soft-recover first (media PLAY)...")
+                                add_log("WARN", udid, f"[MultiApp] [{dn}] unknown for {int(seconds_since_good)}s. Trying force-stop + relaunch...")
                                 app_forcestop_count[app_key] = fs_count + 1
                                 app_last_forcestop_time[app_key] = now2
-                                # SOFT recovery: a wrong dumpsys read often reports
-                                # unknown while audio keeps playing. Nudge it gently
-                                # and re-check before touching the app.
-                                st2 = 'unknown'
                                 try:
-                                    _adb_media_play(udid)
-                                    time.sleep(6)
-                                    st2, _t2, _a2 = _get_now_playing(udid, pkg)
-                                    if st2 == 'PLAYING':
+                                    ui_lock = _get_device_ui_lock(udid)
+                                    ui_lock.acquire()
+                                    try:
+                                        _ensure_volume_max(udid)
+                                        _adb_shell(udid, f'am force-stop {pkg}')
+                                        time.sleep(2)
+                                        _enable_multi_audio_focus(udid)
+                                        _multi_app_relaunch_after_link(udid, app_key, pkg, dn)
+                                        link_info_new = getattr(_multi_app_relink_app, '_link_info', {})
+                                        if app_key in link_info_new:
+                                            info = link_info_new[app_key]
+                                            app_relink_counters[app_key] = info.get('remaining', random.randint(8, 25))
+                                            app_total_songs_in_link[app_key] = info.get('total_songs', app_relink_counters[app_key])
+                                            app_link_types[app_key] = info.get('type', 'Unknown')
                                         app_consecutive_bad[app_key] = 0
                                         app_last_good_time[app_key] = time.time()
-                                        app_timers[app_key] = time.time()
-                                        add_log("SUCC", udid, f"[MultiApp] [{dn}] recovered via media PLAY (was false unknown)")
-                                        continue
+                                        add_log("SUCC", udid, f"[MultiApp] [{dn}] Recovery complete after unknown")
+                                    finally:
+                                        ui_lock.release()
                                 except Exception as e:
-                                    add_log("ERR.", udid, f"[MultiApp] [{dn}] Soft recover error: {e}")
-                                if st2 in ('STOPPED', 'PAUSED') or st2 == 'ERROR':
-                                    try:
-                                        ui_lock = _get_device_ui_lock(udid)
-                                        ui_lock.acquire()
-                                        try:
-                                            _ensure_volume_max(udid)
-                                            _adb_shell(udid, f'am force-stop {pkg}')
-                                            time.sleep(2)
-                                            _enable_multi_audio_focus(udid)
-                                            _multi_app_relaunch_after_link(udid, app_key, pkg, dn)
-                                            link_info_new = getattr(_multi_app_relink_app, '_link_info', {})
-                                            if app_key in link_info_new:
-                                                info = link_info_new[app_key]
-                                                app_relink_counters[app_key] = info.get('remaining', random.randint(8, 25))
-                                                app_total_songs_in_link[app_key] = info.get('total_songs', app_relink_counters[app_key])
-                                                app_link_types[app_key] = info.get('type', 'Unknown')
-                                            app_consecutive_bad[app_key] = 0
-                                            app_last_good_time[app_key] = time.time()
-                                            add_log("SUCC", udid, f"[MultiApp] [{dn}] Recovery complete (force-stop after confirmed dead)")
-                                        finally:
-                                            ui_lock.release()
-                                    except Exception as e:
-                                        add_log("ERR.", udid, f"[MultiApp] [{dn}] Recovery failed: {e}")
+                                    add_log("ERR.", udid, f"[MultiApp] [{dn}] Recovery failed: {e}")
             if status_parts:
                 add_log("INFO", udid, f"[MultiApp] HEALTH: {' | '.join(status_parts)}")
             update_thread_status(udid, f'[MultiApp] Health OK', None, False, False, False, False, False, None)
@@ -8061,29 +7743,14 @@ def main_function(config_data):
                 while True:
                     if stop_flags.get(f"{udid}_multiapp") or stop_flags.get(udid):
                         break
-                    validation_ok = None
                     if udid in proxy_blocked_devices:
-                        add_log("WARN", udid, "[Proxy] Device blocked due to proxy failure. Waiting 60s before next round...")
-                        time.sleep(60)
-                        if stop_flags.get(f"{udid}_multiapp") or stop_flags.get(udid):
-                            break
-                        add_log("INFO", udid, "[Proxy] Retrying proxy validation for blocked device...")
-                        try:
-                            if _validate_device_proxy(udid, binded_proxy, conn_type):
-                                proxy_blocked_devices.discard(udid)
-                                validation_ok = True
-                                add_log("SUCC", udid, "[Proxy] Device reconnected. Resuming playback.")
-                            else:
-                                add_log("WARN", udid, "[Proxy] Still blocked; will retry next round.")
-                                continue
-                        except Exception as e:
-                            add_log("ERR.", udid, f"[Proxy] Retry validation error: {e}")
-                            continue
+                        add_log("WARN", udid, "[Proxy] Device blocked due to proxy failure. Waiting for restart...")
+                        time.sleep(30)
+                        continue
                     try:
-                        if validation_ok is None:
-                            if not _validate_device_proxy(udid, binded_proxy, conn_type):
-                                add_log("ERR.", udid, "[Proxy] Proxy validation failed. Device stopped for this round; will retry.")
-                                continue
+                        if not _validate_device_proxy(udid, binded_proxy, conn_type):
+                            add_log("ERR.", udid, "[Proxy] Proxy validation failed. Skipping device.")
+                            break
                         if stop_flags.get(f"{udid}_multiapp") or stop_flags.get(udid):
                             break
                         _multi_app_start_all(apps, udid, binded_account, binded_proxy, conn_type, acc_type)
@@ -8833,18 +8500,6 @@ def get_version():
 @app.route('/check_update', methods=['GET'])
 @require_token
 def check_update():
-    import re
-    def _ver_tuple(s):
-        try:
-            return tuple(int(x) for x in s.split("."))
-        except Exception:
-            return (0, 0, 0)
-    current = _ver_tuple(Bot_version)
-    remote_tag = ""
-    remote_notes = ""
-    errors = []
-    # 1) CDN estatico (SIN cuota de API): /releases/latest responde 302 hacia
-    #    .../releases/tag/vX.Y.Z. Misma infraestructura que el ZIP de instalacion.
     try:
         import urllib.request
         import urllib.error
@@ -8852,59 +8507,31 @@ def check_update():
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
-        req = urllib.request.Request(
-            f"https://github.com/{GITHUB_REPO}/releases/latest",
-            headers={"User-Agent": "Mozilla/5.0 (Spotifix-Updater)"})
+        url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+        req = urllib.request.Request(url, headers={"User-Agent": "Spotifix-Updater"})
         with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
-            final_url = resp.geturl()
-        m = re.search(r'releases/tag/v?([0-9][0-9\.]*)', final_url or "")
-        if m:
-            remote_tag = m.group(1)
-        else:
-            errors.append(f"cdnsin tag en redirect: {final_url}")
+            data = json.loads(resp.read().decode())
+        remote_tag = data.get("tag_name", "").lstrip("v")
+        remote_notes = data.get("body", "")
+        current = tuple(int(x) for x in Bot_version.split("."))
+        remote = tuple(int(x) for x in remote_tag.split(".")) if remote_tag else (0, 0, 0)
+        has_update = remote > current
+        return jsonify({
+            "has_update": has_update,
+            "current_version": Bot_version,
+            "remote_version": remote_tag,
+            "release_notes": remote_notes
+        })
     except Exception as e:
-        errors.append(f"cdn: {e.__class__.__name__}: {e}")
-    # 2) Fallback a la API de GitHub solo si el CDN no devolvio la version
-    if not remote_tag:
-        try:
-            import urllib.request
-            import urllib.error
-            import ssl
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
-            req = urllib.request.Request(url, headers={"User-Agent": "Spotifix-Updater"})
-            with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
-                data = json.loads(resp.read().decode())
-            remote_tag = data.get("tag_name", "").lstrip("v")
-            remote_notes = data.get("body", "")
-        except Exception as e:
-            errors.append(f"api: {e.__class__.__name__}: {e}")
-    if not remote_tag:
-        err_text = " ; ".join(errors) or "unknown error"
-        add_log("WARN", "updater", f"[Updater] check_update fallo: {err_text}")
-        return jsonify({"has_update": False, "current_version": Bot_version,
-                        "remote_version": "", "error": err_text})
-    remote = _ver_tuple(remote_tag)
-    has_update = remote > current
-    add_log("INFO", "updater", f"[Updater] check_update: current={Bot_version} remote={remote_tag} has_update={has_update}")
-    return jsonify({
-        "has_update": has_update,
-        "current_version": Bot_version,
-        "remote_version": remote_tag,
-        "release_notes": remote_notes
-    })
+        return jsonify({"has_update": False, "error": str(e)})
 
 
-CORE_FILES_TO_UPDATE = [
+SOURCE_FILES_TO_UPDATE = [
     'api.py', 'renderer.js', 'index.html', 'login.html',
     'main.js', 'preload.js', 'package.json',
+    'Tools/spotify-signup.ps1', 'Tools/capsolver_spotify.py',
+    'apk/SoundAssistant.apk', 'apk/SoundAssistant_1.3.5.14.1.apk'
 ]
-AUX_FILES_TO_UPDATE = [
-    'apk/SoundAssistant.apk', 'apk/SoundAssistant_1.3.5.14.1.apk',
-]
-SOURCE_FILES_TO_UPDATE = CORE_FILES_TO_UPDATE + AUX_FILES_TO_UPDATE
 
 
 @app.route('/install_update', methods=['POST'])
@@ -8926,122 +8553,31 @@ def install_update():
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
         opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
-        def _explain(err):
-            status = ""
-            if hasattr(err, 'code'):
-                status = f" HTTP_{err.code}"
-            reason = getattr(err, 'reason', None) or (err.args and err.args[0]) or ''
-            return f"{type(err).__name__}{status} {reason} {err}".strip()
-
-        def _fetch_contents_api(fname):
-            url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{fname}?ref={branch}"
-            req = urllib.request.Request(url, headers={'User-Agent': 'Spotifix-Updater'})
-            resp = opener.open(req, timeout=30)
-            meta = json.loads(resp.read().decode())
-            if 'content' in meta and meta['content']:
-                import base64
-                return base64.b64decode(meta['content'])
-            if meta.get('download_url'):
-                resp2 = opener.open(meta['download_url'], timeout=60)
-                return resp2.read()
-            return None
-
-        def _fetch_raw_http(fname):
-            url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/{branch}/{fname}"
-            req = urllib.request.Request(url, headers={'User-Agent': 'Spotifix-Updater'})
-            resp = opener.open(req, timeout=60)
-            return resp.read()
-
-        def _fetch_raw_github(fname):
-            url = f"https://github.com/{GITHUB_REPO}/raw/{branch}/{fname}"
-            req = urllib.request.Request(url, headers={'User-Agent': 'Spotifix-Updater'})
-            resp = opener.open(req, timeout=60)
-            return resp.read()
-
-        def _fetch_one_file(fname):
-            last_errors = []
-            for attempt in range(3):
-                for fn in (_fetch_raw_http, _fetch_raw_github, _fetch_contents_api):
-                    try:
-                        b = fn(fname)
-                        if b is not None and len(b) > 0:
-                            return b
-                    except Exception as e:
-                        last_errors.append(f"{fn.__name__}: {_explain(e)}")
-                if attempt < 2:
-                    time.sleep(3)
-            add_log("WARN", "updater", f"[Updater] fallos descargando {fname}: {'; '.join(last_errors)}")
-            return None
-
-        def _fetch_release_zip():
-            tag = remote_version if remote_version.startswith('v') else 'v' + remote_version
-            candidates = [
-                f"https://codeload.github.com/{GITHUB_REPO}/zip/refs/tags/{tag}",
-                f"https://github.com/{GITHUB_REPO}/archive/refs/tags/{tag}.zip",
-            ]
-            last_err = ""
-            for url in candidates:
-                for attempt in range(2):
-                    try:
-                        req = urllib.request.Request(url, headers={'User-Agent': 'Spotifix-Updater'})
-                        resp = opener.open(req, timeout=180)
-                        import zipfile
-                        import io
-                        zf = zipfile.ZipFile(io.BytesIO(resp.read()))
-                        root_name = None
-                        files_map = {}
-                        for name in zf.namelist():
-                            if name.endswith('/'):
-                                continue
-                            parts = name.split('/')
-                            if len(parts) < 2:
-                                continue
-                            if root_name is None:
-                                root_name = parts[0]
-                            if parts[0] != root_name:
-                                continue
-                            rel = '/'.join(parts[1:])
-                            if rel in SOURCE_FILES_TO_UPDATE:
-                                files_map[rel] = zf.read(name)
-                        zf.close()
-                        if files_map:
-                            return files_map
-                        last_err = "ZIP sin archivos relevantes"
-                    except Exception as e:
-                        last_err = _explain(e)
-                        add_log("WARN", "updater", f"[Updater] ZIP {url} attempt {attempt+1} fallo: {last_err}")
-                        time.sleep(3)
-            if last_err:
-                raise RuntimeError(last_err)
-            return None
-
-        zip_files = None
-        try:
-            zip_files = _fetch_release_zip()
-            if zip_files:
-                add_log("INFO", "updater", f"Release ZIP v{remote_version} downloaded ({len(zip_files)} files)")
-        except Exception as e:
-            add_log("WARN", "updater", f"Release ZIP failed, falling back to per-file: {_explain(e)}")
-
         for fname in SOURCE_FILES_TO_UPDATE:
+            # Use the GitHub Contents API (no CDN cache) so we always get the newest file.
+            # Note: for >1MB files GitHub returns empty content + download_url, so fall back to it.
+            raw_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{fname}?ref={branch}"
             dest = os.path.join(app_dir, fname)
-            data = zip_files.get(fname) if zip_files else None
-            if data is None:
-                data = _fetch_one_file(fname)
-            if data is None:
-                err_note = f"{fname}: no se pudo descargar"
-                if fname in AUX_FILES_TO_UPDATE:
-                    add_log("WARN", "updater", f"[Updater] {err_note} - BEST-EFFORT: se omite, la app sigue.")
-                    continue
-                failed.append(err_note)
-                continue
             try:
                 os.makedirs(os.path.dirname(dest), exist_ok=True)
+                req = urllib.request.Request(raw_url, headers={'User-Agent': 'Spotifix-Updater'})
+                resp = opener.open(req, timeout=30)
+                meta = json.loads(resp.read().decode())
+                data = None
+                if 'content' in meta and meta['content']:
+                    import base64
+                    data = base64.b64decode(meta['content'])
+                elif meta.get('download_url'):
+                    resp2 = opener.open(meta['download_url'], timeout=60)
+                    data = resp2.read()
+                if data is None or len(data) == 0:
+                    failed.append(f"{fname}: empty download")
+                    continue
                 with open(dest, 'wb') as f:
                     f.write(data)
                 downloaded.append(fname)
             except Exception as e:
-                failed.append(f"{fname}: write: {_explain(e)}")
+                failed.append(f"{fname}: {e}")
         if not failed:
             add_log("SUCC", "updater", f"Updated {len(downloaded)} files to v{remote_version}. Restarting...")
             flag_path = os.path.join(app_dir, '_update_restart')
@@ -9086,68 +8622,5 @@ def install_update():
         return jsonify({"success": False, "error": str(e)})
 
 
-def _dashboard_np_refresh_worker():
-    """Background refresher for the LIVE dashboard.
-
-    Instead of the frontend hitting /get_dashboard every 8s and triggering a
-    dumpsys for EVERY app on EVERY device at once (which saturates adb with
-    even 15-20 phones and dies at 50-100), this worker walks the cache slowly
-    (TTL 10s per entry) so at any moment only a few dumpsys run in parallel.
-    /get_dashboard just reads the warm cache -> instant response at any scale.
-    """
-    app_map = {
-        'spotify': ('com.spotify.music', 'Spotify'),
-        'tidal': ('com.aspiro.tidal', 'Tidal'),
-        'apple_music': ('com.apple.android.music', 'Apple Music'),
-    }
-    while not _dashboard_worker_stop.is_set():
-        try:
-            all_udids = []
-            for key in list(worker_threads.keys()):
-                udid = key.replace('_multiapp', '').replace('_spotify', '').replace('_tidal', '').replace('_apple_music', '')
-                if udid and udid not in all_udids:
-                    all_udids.append(udid)
-            # If no bot threads, fall back to devices known by the batch table.
-            if not all_udids:
-                devices = globals().get('_devices_overview', None)
-                if callable(devices):
-                    try:
-                        devs = devices()
-                        if isinstance(devs, list):
-                            all_udids = [d.get('udid') for d in devs if d.get('udid')]
-                    except Exception:
-                        all_udids = []
-            refreshed_any = False
-            for udid in all_udids:
-                for app_key in app_map:
-                    pkg, _label = app_map[app_key]
-                    ck = (udid, pkg)
-                    with _dashboard_lock:
-                        cached = _dashboard_np_cache.get(ck)
-                    if cached and (time.time() - cached.get('ts', 0)) < 10:
-                        continue
-                    # Refresh this slot (rate limited by the semaphore).
-                    state, title, artist = _get_now_playing(udid, pkg)
-                    if state == 'unknown' or (state == 'ERROR' and not title):
-                        prev = _dashboard_np_cache.get(ck)
-                        if prev and prev.get('state') in ('PLAYING', 'PAUSED', 'BUFFERING', 'STOPPED') and prev.get('title'):
-                            state, title, artist = prev['state'], prev['title'], prev['artist']
-                    with _dashboard_lock:
-                        _dashboard_np_cache[ck] = {'ts': time.time(), 'state': state, 'title': title, 'artist': artist}
-                    refreshed_any = True
-                    # Small delay between slots: keeps adb server sane at scale.
-                    if refreshed_any and len(all_udids) > 10:
-                        time.sleep(0.15)
-            if not refreshed_any:
-                time.sleep(2)
-        except Exception:
-            time.sleep(2)
-
-
 if __name__ == '__main__':
-    _dashboard_worker = threading.Thread(target=_dashboard_np_refresh_worker, daemon=True)
-    _dashboard_worker.start()
-    try:
-        app.run(port=8999, debug=False, threaded=True)
-    finally:
-        _dashboard_worker_stop.set()
+    app.run(port=8999, debug=False)

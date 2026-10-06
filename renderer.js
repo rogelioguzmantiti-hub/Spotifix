@@ -1061,12 +1061,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     headers: { 'Authorization': 'Bearer ' + authToken }
                 })
                 .then(r => r.json())
-                .then(d => {
-                    if (versionLabel && d.version) versionLabel.textContent = 'Current version: ' + d.version;
-                    if (d.version) document.title = 'SpotiFix ' + d.version;
-                    const headLabel = document.getElementById('appVersionLabel');
-                    if (headLabel && d.version) headLabel.textContent = 'Spotifix ' + d.version;
-                })
+                .then(d => { if (versionLabel && d.version) versionLabel.textContent = 'Current version: ' + d.version; })
                 .catch(() => {});
 
                 let pendingRemoteVersion = null;
@@ -1088,7 +1083,7 @@ document.addEventListener('DOMContentLoaded', () => {
                         checkBtn.disabled = false;
                         checkBtn.textContent = 'Check for Updates';
                         if (data.error) {
-                            statusDiv.innerHTML = '<p style="color: red;">Error: ' + (data.error || 'Unknown error') + '</p>';
+                            statusDiv.innerHTML = '<p style="color: red;">Error: ' + data.error + '</p>';
                             return;
                         }
                         if (data.has_update) {
@@ -1162,7 +1157,9 @@ document.addEventListener('DOMContentLoaded', () => {
                 analyticsBtn: 'analytics',
                 settingsBtn: 'settings',
                 chatBtn: 'chat',
-                timerBtn: 'timer'
+                timerBtn: 'timer',
+                automatBtn: 'automat',
+                accountcreatBtn: 'accountcreat'
             };
 
             Object.keys(sidebarButtons).forEach(buttonId => {
@@ -1434,6 +1431,638 @@ document.addEventListener('DOMContentLoaded', () => {
                 setInterval(loadTimerState, 5000);
             })();
 
+            // ---- Automat: registro de Spotify (ADB) ----
+            (function () {
+                const api = window.electronAPI;
+                const emailEl = document.getElementById('automatEmail');
+                const passEl = document.getElementById('automatPassword');
+                const artistsEl = document.getElementById('automatArtists');
+                const minEl = document.getElementById('automatMinArtists');
+                const serialEl = document.getElementById('automatSerial');
+                const dobRandomEl = document.getElementById('automatDobRandom');
+                const dobManualEl = document.getElementById('automatDobManual');
+                const dobDateEl = document.getElementById('automatDobDate');
+                const skipDobEl = document.getElementById('automatSkipDob');
+                const genderEl = document.getElementById('automatRandomGender');
+                const submitEl = document.getElementById('automatSubmit');
+                const startEl = document.getElementById('automatStart');
+                const cancelEl = document.getElementById('automatCancel');
+                const refreshEl = document.getElementById('automatRefresh');
+                const statusEl = document.getElementById('automatStatus');
+                const logEl = document.getElementById('automatLog');
+                if (!api || !emailEl) return;
+
+                let running = false;
+
+                // El date input no admite max; se calculan los limites en texto y
+                // se aplican igual que en la GUI: solo adultos (18+).
+                const today = new Date();
+                function iso(d) {
+                    return d.getFullYear() + '-' +
+                        String(d.getMonth() + 1).padStart(2, '0') + '-' +
+                        String(d.getDate()).padStart(2, '0');
+                }
+                dobDateEl.min = iso(new Date(today.getFullYear() - 80, today.getMonth(), today.getDate()));
+                dobDateEl.max = iso(new Date(today.getFullYear() - 18, today.getMonth(), today.getDate()));
+                dobDateEl.value = iso(new Date(today.getFullYear() - 25, today.getMonth(), today.getDate()));
+
+                function setStatus(text, error) {
+                    if (!statusEl) return;
+                    statusEl.textContent = text;
+                    statusEl.style.color = error ? '#e74c3c' : '#aaa';
+                }
+
+                function appendLog(text) {
+                    if (!logEl) return;
+                    logEl.textContent += text;
+                    logEl.scrollTop = logEl.scrollHeight;
+                }
+
+                function setRunning(on) {
+                    running = on;
+                    [emailEl, passEl, artistsEl, minEl, serialEl, dobRandomEl, dobManualEl,
+                    dobDateEl, skipDobEl, genderEl, submitEl, refreshEl].forEach((el) => {
+                        if (el) el.disabled = on;
+                    });
+                    if (startEl) startEl.disabled = on;
+                    if (cancelEl) cancelEl.disabled = !on;
+                    updateDobState();
+                }
+
+                function updateDobState() {
+                    if (dobDateEl) dobDateEl.disabled = running || !dobManualEl.checked || skipDobEl.checked;
+                }
+
+                dobManualEl.addEventListener('change', updateDobState);
+                skipDobEl.addEventListener('change', updateDobState);
+
+                function refreshDevices() {
+                    setStatus('Buscando dispositivos adb...', false);
+                    api.automatDevices().then((res) => {
+                        if (!res || !res.ok) {
+                            setStatus((res && res.error) || 'No se pudieron listar los dispositivos.', true);
+                            return;
+                        }
+                        const current = serialEl.value;
+                        serialEl.innerHTML = '';
+                        res.devices.forEach((d) => {
+                            const opt = document.createElement('option');
+                            opt.value = d;
+                            opt.textContent = d;
+                            serialEl.appendChild(opt);
+                        });
+                        if (current && res.devices.indexOf(current) !== -1) serialEl.value = current;
+                        if (res.devices.length === 0) {
+                            setStatus('adb no ve ningun dispositivo listo. Enciende el telefono.', true);
+                        } else {
+                            setStatus('Listo. ' + res.devices.length + ' dispositivo(s) detectado(s).', false);
+                        }
+                    });
+                }
+
+                if (refreshEl) refreshEl.addEventListener('click', refreshDevices);
+
+                if (cancelEl) {
+                    cancelEl.addEventListener('click', () => {
+                        if (!running) return;
+                        api.automatCancel();
+                        appendLog('\n-- Cancelado.\n');
+                    });
+                }
+
+                if (startEl) {
+                    startEl.addEventListener('click', () => {
+                        if (running) return;
+
+                        const email = emailEl.value.trim();
+                        if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+                            setStatus('El correo no parece valido.', true);
+                            emailEl.focus();
+                            return;
+                        }
+                        const password = passEl.value;
+                        if (password.length === 0) {
+                            setStatus('Escribe la contrasena.', true);
+                            passEl.focus();
+                            return;
+                        }
+                        // Spotify exige minimo 10 caracteres. Se comprueba aqui porque
+                        // el fallo real aparece en el movil, dos minutos despues.
+                        if (password.length < 10) {
+                            setStatus('La contrasena tiene ' + password.length +
+                                ' caracteres y Spotify pide al menos 10.', true);
+                            passEl.focus();
+                            return;
+                        }
+                        if (!serialEl.value) {
+                            setStatus('Selecciona un dispositivo.', true);
+                            return;
+                        }
+
+                        setStatus('Ejecutando... no cierres Spotify a mano.', false);
+                        logEl.textContent = '';
+                        appendLog('$ adb -s ' + serialEl.value + '  spotify-signup.ps1\n\n');
+
+                        api.automatStart({
+                            email: email,
+                            password: password,
+                            serial: serialEl.value,
+                            dobMode: dobRandomEl.checked ? 'random' : 'manual',
+                            dobDate: dobDateEl.value,
+                            skipDob: skipDobEl.checked,
+                            randomGender: genderEl.checked,
+                            submit: submitEl.checked,
+                            artists: artistsEl.value,
+                            minArtists: minEl.value
+                        }).then((res) => {
+                            if (!res || !res.ok) {
+                                setStatus((res && res.error) || 'No se pudo arrancar el registro.', true);
+                                setRunning(false);
+                                return;
+                            }
+                            setRunning(true);
+                        });
+                    });
+                }
+
+                api.onAutomatLog((chunk) => appendLog(chunk));
+
+                api.onAutomatDone((info) => {
+                    const code = info && typeof info.code === 'number' ? info.code : -1;
+                    setRunning(false);
+                    const msg = code === 0
+                        ? 'Terminado. Mira el log: el script se detiene antes de confirmar la cuenta.'
+                        : 'Terminado con codigo ' + code + '. El error esta arriba del todo.';
+                    setStatus(msg, code !== 0);
+                    appendLog('\n' + msg + '\n');
+                });
+
+                setRunning(false);
+                refreshDevices();
+            })();
+
+            // ---- Accountcreat: generador de correos ----
+            (function () {
+                const api = window.electronAPI;
+                const cantidadEl = document.getElementById('accountcreatCantidad');
+                const runEl = document.getElementById('accountcreatRun');
+                const cancelEl = document.getElementById('accountcreatCancel');
+                const copyEl = document.getElementById('accountcreatCopy');
+                const saveEl = document.getElementById('accountcreatSave');
+                const clearEl = document.getElementById('accountcreatClear');
+                const statusEl = document.getElementById('accountcreatStatus');
+                const logEl = document.getElementById('accountcreatLog');
+                const listEl = document.getElementById('accountcreatList');
+                const countEl = document.getElementById('accountcreatCount');
+                if (!api || !cantidadEl || !logEl) return;
+
+                let running = false;
+                let saveTimer = null;
+
+                function setStatus(text, error) {
+                    if (!statusEl) return;
+                    statusEl.textContent = text;
+                    statusEl.style.color = error ? '#e74c3c' : '#aaa';
+                }
+
+                function count() {
+                    return logEl.value.split('\n').filter((l) => l.trim().length > 0).length;
+                }
+
+                function updateCount() {
+                    if (countEl) countEl.textContent = String(count());
+                }
+
+                function persist() {
+                    api.accountcreatSaveText({ text: logEl.value });
+                }
+
+                function renderAccountcreatList(text) {
+                    if (!listEl) return;
+                    const lines = (text || '').split(/\r?\n/);
+                    let html = '';
+                    for (let i = 0; i < lines.length; i++) {
+                        const trimmed = lines[i].trim();
+                        if (trimmed === '') continue;
+                        const resOk = /:.*Melona3030\.\s*$/.test(trimmed) && !/\(verificar\)/i.test(trimmed);
+                        const resCheck = /\(verificar\)/i.test(trimmed);
+                        let color = '#ccc';
+                        if (resOk) color = '#4d9c5d';
+                        else if (resCheck) color = '#e6b24f';
+                        else color = '#e74c3c';
+                        html += '<div style="color:' + color + '">' + escapeHtml(trimmed) + '</div>';
+                    }
+                    listEl.innerHTML = html || '<div style="color:#888">No hay cuentas filtradas aún.</div>';
+                }
+
+                function escapeHtml(s) {
+                    return String(s)
+                        .replace(/&/g, '&amp;')
+                        .replace(/</g, '&lt;')
+                        .replace(/>/g, '&gt;')
+                        .replace(/"/g, '&quot;')
+                        .replace(/'/g, '&#39;');
+                }
+
+                function loadAndRender() {
+                    api.accountcreatLoad().then((res) => {
+                        if (res && res.ok) {
+                            const t = res.text || '';
+                            if (logEl) logEl.value = t;
+                            renderAccountcreatList(t);
+                        }
+                        updateCount();
+                    });
+                }
+
+                // Se guarda un momento despues de teclear, no en cada pulsacion:
+                // escribir a mano dispararia una escritura por letra.
+                function persistSoon() {
+                    updateCount();
+                    if (saveTimer) clearTimeout(saveTimer);
+                    saveTimer = setTimeout(persist, 800);
+                }
+
+                function setRunning(on) {
+                    running = on;
+                    // Durante la generacion el area se bloquea: si no, lo que
+                    // llegue del proceso se escreveria encima de lo que el
+                    // usuario este escribiendo en ese momento.
+                    logEl.disabled = on;
+                    if (cantidadEl) cantidadEl.disabled = on;
+                    if (runEl) runEl.disabled = on;
+                    if (cancelEl) cancelEl.disabled = !on;
+                    if (copyEl) copyEl.disabled = on;
+                    if (saveEl) saveEl.disabled = on;
+                    if (clearEl) clearEl.disabled = on;
+                }
+
+                logEl.addEventListener('input', () => {
+                    if (saveTimer) clearTimeout(saveTimer);
+                    saveTimer = setTimeout(() => {
+                        const t = logEl.value;
+                        api.accountcreatSave(t).then((res) => {
+                            if (res && !res.ok) {
+                                setStatus(res.error || 'No se pudo guardar.', true);
+                                return;
+                            }
+                            renderAccountcreatList(t);
+                        });
+                    }, 800);
+                    updateCount();
+                });
+
+                if (runEl) {
+                    runEl.addEventListener('click', () => {
+                        if (running) return;
+                        const cantidad = parseInt(cantidadEl.value, 10);
+                        if (isNaN(cantidad) || cantidad < 1) {
+                            setStatus('Escribe una cantidad valida (1 o mas).', true);
+                            cantidadEl.focus();
+                            return;
+                        }
+                        if (cantidad > 100000) {
+                            setStatus('La cantidad no puede superar 100000.', true);
+                            cantidadEl.focus();
+                            return;
+                        }
+                        if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+                        setStatus('Generando...', false);
+                        api.accountcreatRun({ cantidad: cantidad }).then((res) => {
+                            if (!res || !res.ok) {
+                                setStatus((res && res.error) || 'No se pudo generar.', true);
+                                setRunning(false);
+                                return;
+                            }
+                            setRunning(true);
+                        });
+                    });
+                }
+
+                if (cancelEl) {
+                    cancelEl.addEventListener('click', () => {
+                        if (!running) return;
+                        api.accountcreatCancel();
+                    });
+                }
+
+                if (copyEl) {
+                    copyEl.addEventListener('click', () => {
+                        if (!logEl.value.trim()) {
+                            setStatus('No hay correos que copiar.', true);
+                            return;
+                        }
+                        navigator.clipboard.writeText(logEl.value).then(() => {
+                            setStatus('Copiados al portapapeles.', false);
+                        }).catch(() => {
+                            setStatus('No se pudo copiar al portapapeles.', true);
+                        });
+                    });
+                }
+
+                if (saveEl) {
+                    saveEl.addEventListener('click', () => {
+                        if (!logEl.value.trim()) {
+                            setStatus('No hay correos que guardar.', true);
+                            return;
+                        }
+                        api.accountcreatSave({ content: logEl.value }).then((res) => {
+                            if (!res || res.canceled) return;
+                            if (!res.ok) {
+                                setStatus(res.error || 'No se pudo guardar.', true);
+                                return;
+                            }
+                            setStatus('Guardado en ' + res.path, false);
+                        });
+                    });
+                }
+
+                if (clearEl) {
+                    clearEl.addEventListener('click', () => {
+                        if (!logEl.value.trim()) {
+                            setStatus('No hay nada que borrar.', true);
+                            return;
+                        }
+                        if (!confirm('Se borraran los ' + count() + ' correo(s) de la lista. Continuar?')) return;
+                        if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+                        logEl.value = '';
+                        updateCount();
+                        renderAccountcreatList('');
+                        api.accountcreatClear().then(() => {
+                            setStatus('Lista vaciada.', false);
+                        });
+                    });
+                }
+
+                api.onAccountcreatLog((chunk) => {
+                    // No se pinta aqui: al terminar el proceso el main ya ha
+                    // enumerado y guardado el texto. Aqui solo se avisa.
+                    if (logEl) logEl.scrollTop = logEl.scrollHeight;
+                });
+
+                api.onAccountcreatDone((info) => {
+                    const code = info && typeof info.code === 'number' ? info.code : -1;
+                    setRunning(false);
+                    if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+                    // Se recarga desde disco: la numeracion la aplica el main al
+                    // anexar, y asi el panel y el archivo nunca se desincronizan.
+                    api.accountcreatLoad().then((res) => {
+                        if (res && res.ok) {
+                            const t = res.text || '';
+                            if (logEl) logEl.value = t;
+                            renderAccountcreatList(t);
+                        }
+                        updateCount();
+                        const total = (info && info.total) || 0;
+                        const msg = code === 0
+                            ? 'Listo. ' + total + ' correo(s) anadido(s). Total en la lista: ' + count() + '.'
+                            : 'Terminado con codigo ' + code + '. Revisa el panel.';
+                        setStatus(msg, code !== 0);
+                    });
+                });
+
+                setRunning(false);
+                api.accountcreatLoad().then((res) => {
+                    if (res && res.ok) {
+                            const t = res.text || '';
+                            if (logEl) logEl.value = t;
+                            renderAccountcreatList(t);
+                        }
+                        updateCount();
+                        if (count() > 0) setStatus('Lista cargada. ' + count() + ' correo(s).', false);
+                    });
+            })();
+
+            // ---- Automat: lote ----
+            (function () {
+                const api = window.electronAPI;
+                const startEl = document.getElementById('batchStart');
+                if (!api || !startEl) return;
+
+                const cantidadEl = document.getElementById('batchCantidad');
+                const contEl = document.getElementById('batchContinue');
+                const stopEl = document.getElementById('batchStop');
+                const exportEl = document.getElementById('batchExport');
+                const resumeEl = document.getElementById('batchResume');
+                const statusEl = document.getElementById('batchStatus');
+                const countsEl = document.getElementById('batchCounts');
+                const currentEl = document.getElementById('batchCurrent');
+                const logEl = document.getElementById('batchLog');
+
+                // Se leen del bloque de registro manual: el lote usa exactamente
+                // los mismos datos que se ven arriba en el formulario.
+                const emailEl = document.getElementById('automatEmail');
+                const passEl = document.getElementById('automatPassword');
+                const artistsEl = document.getElementById('automatArtists');
+                const minEl = document.getElementById('automatMinArtists');
+                const dobRandomEl = document.getElementById('automatDobRandom');
+                const dobManualEl = document.getElementById('automatDobManual');
+                const dobDateEl = document.getElementById('automatDobDate');
+                const skipDobEl = document.getElementById('automatSkipDob');
+                const genderEl = document.getElementById('automatRandomGender');
+                const submitEl = document.getElementById('automatSubmit');
+
+                let active = false;
+                let counts = { ok: 0, captcha: 0, fail: 0, total: 0 };
+
+                function setStatus(text, color) {
+                    if (statusEl) {
+                        statusEl.textContent = text;
+                        statusEl.style.color = color || '#aaa';
+                    }
+                }
+
+                function setCounts() {
+                    if (!countsEl) return;
+                    const done = counts.ok + counts.captcha + counts.fail;
+                    countsEl.textContent = 'Progreso: ' + done + '/' + counts.total +
+                        ' · correctas: ' + counts.ok +
+                        ' · con CAPTCHA: ' + counts.captcha +
+                        ' · con error: ' + counts.fail;
+                }
+
+                function appendLog(text) {
+                    if (!logEl) return;
+                    logEl.textContent += text;
+                    logEl.scrollTop = logEl.scrollHeight;
+                }
+
+                function setActive(on) {
+                    active = on;
+                    if (startEl) startEl.disabled = on;
+                    if (stopEl) stopEl.disabled = !on;
+                    if (contEl && !on) contEl.disabled = true;
+                    if (cantidadEl) cantidadEl.disabled = on;
+                }
+
+                function setPaused(on) {
+                    if (contEl) contEl.disabled = !on;
+                }
+
+                startEl.addEventListener('click', () => {
+                    if (active) return;
+                    const cantidad = parseInt(cantidadEl.value, 10);
+                    if (isNaN(cantidad) || cantidad < 1) {
+                        setStatus('Escribe una cantidad valida (1 o mas).', '#e74c3c');
+                        return;
+                    }
+                    if (cantidad > 10000) {
+                        setStatus('La cantidad no puede superar 10000.', '#e74c3c');
+                        return;
+                    }
+                    const password = passEl ? passEl.value : '';
+                    if (!password) {
+                        setStatus('Escribe la contrasena en el formulario de arriba.', '#e74c3c');
+                        return;
+                    }
+                    if (password.length < 10) {
+                        setStatus('La contrasena tiene ' + password.length +
+                            ' caracteres y Spotify pide al menos 10.', '#e74c3c');
+                        return;
+                    }
+
+                    counts = { ok: 0, captcha: 0, fail: 0, total: cantidad };
+                    setCounts();
+                    if (logEl) logEl.textContent = '';
+                    if (currentEl) currentEl.textContent = '';
+                    setPaused(false);
+                    setActive(true);
+
+                    api.batchStart({
+                        cantidad: cantidad,
+                        password: password,
+                        opts: {
+                            dobMode: dobRandomEl.checked ? 'random' : 'manual',
+                            dobDate: dobDateEl.value,
+                            skipDob: skipDobEl.checked,
+                            randomGender: genderEl.checked,
+                            submit: submitEl.checked,
+                            artists: artistsEl.value,
+                            minArtists: minEl.value
+                        }
+                    }).then((res) => {
+                        if (!res || !res.ok) {
+                            setStatus((res && res.error) || 'No se pudo iniciar el lote.', '#e74c3c');
+                            setActive(false);
+                            return;
+                        }
+                        counts.total = res.total;
+                        setCounts();
+                    });
+                });
+
+                if (contEl) {
+                    contEl.addEventListener('click', () => {
+                        if (!active) return;
+                        setPaused(false);
+                        setStatus('Continuando...', '#f1c40f');
+                        api.batchContinue();
+                    });
+                }
+
+                if (stopEl) {
+                    stopEl.addEventListener('click', () => {
+                        if (!active) return;
+                        if (!confirm('Se detiene el lote. Las cuentas ya procesadas se quedan anotadas. Continuar?')) return;
+                        setStatus('Deteniendo...', '#e74c3c');
+                        api.batchStop();
+                    });
+                }
+
+                if (exportEl) {
+                    exportEl.addEventListener('click', () => {
+                        api.batchExport().then((res) => {
+                            if (res && res.ok) {
+                                setStatus('Exportado: ' + res.path, '#2ecc71');
+                                appendLog('\n[export] ' + res.path + '\n');
+                            } else {
+                                setStatus((res && res.error) || 'Nada que exportar.', '#e74c3c');
+                            }
+                        });
+                    });
+                }
+                if (resumeEl) {
+                    api.batchResumeInfo().then((info) => {
+                        if (info && info.pending > 0) {
+                            setStatus('Hay lote pendiente: ' + info.pending + ' cuenta(s). Pulsa Reanudar anterior.', '#f1c40f');
+                        }
+                    });
+                    resumeEl.addEventListener('click', () => {
+                        if (active) return;
+                        counts = { ok: 0, captcha: 0, fail: 0, total: 0 };
+                        if (logEl) logEl.textContent = '';
+                        setActive(true);
+                        api.batchResume().then((res) => {
+                            if (!res || !res.ok) {
+                                setStatus((res && res.error) || 'No se pudo reanudar.', '#e74c3c');
+                                setActive(false);
+                                return;
+                            }
+                            counts.total = res.total;
+                            setCounts();
+                        });
+                    });
+                }
+
+                api.onBatchEvent((ev) => {
+                    if (!ev) return;
+                    const type = ev.type;
+                    const d = ev.data || {};
+
+                    if (type === 'phase') {
+                        setStatus(d, '#f1c40f');
+                        appendLog('\n' + d + '\n');
+                        return;
+                    }
+                    if (type === 'summary') {
+                        counts.ok = d.ok; counts.captcha = d.captcha;
+                        counts.fail = d.fail; counts.total = d.total;
+                        setCounts();
+                        return;
+                    }
+                    if (type === 'item-start') {
+                        if (currentEl) {
+                            currentEl.textContent = '(' + d.indice + '/' + d.total + ') ' + d.email + '  @  ' + d.device;
+                        }
+                        setStatus('Registrando...', '#2ecc71');
+                        appendLog('\n===== (' + d.indice + '/' + d.total + ') ' + d.email + '  @  ' + d.device + ' =====\n');
+                        return;
+                    }
+                    if (type === 'log') {
+                        appendLog(d);
+                        return;
+                    }
+                    if (type === 'item') {
+                        if (d.resultado === 'ok') {
+                            appendLog('>> OK: ' + d.email + ' (' + d.device + ') anotado en Accountcreat.\n');
+                        } else if (d.resultado === 'captcha') {
+                            appendLog('>> CAPTCHA en ' + d.email + ': queda pendiente de verificacion.\n');
+                        } else {
+                            appendLog('>> ERROR en ' + d.email + ': ' + (d.detalle || '') + '\n');
+                        }
+                        if (currentEl) currentEl.textContent = '';
+                        if (d.resultado === 'captcha') {
+                            setStatus('PARADO: ' + d.detalle, '#f1c40f');
+                            setPaused(true);
+                        } else {
+                            setStatus('Registrando...', '#2ecc71');
+                        }
+                        return;
+                    }
+                    if (type === 'finished') {
+                        setActive(false);
+                        setPaused(false);
+                        if (currentEl) currentEl.textContent = '';
+                        setStatus(d.resumen, d.parcial ? '#e74c3c' : '#2ecc71');
+                        appendLog('\n' + d.resumen + '\n');
+                        return;
+                    }
+                });
+
+                setActive(false);
+                setCounts();
+            })();
+
             const startStopButton = document.getElementById('startStopButton');
             if (startStopButton) {
                 startStopButton.addEventListener('click', () => startBot());
@@ -1659,7 +2288,7 @@ document.addEventListener('DOMContentLoaded', () => {
                             if (statsIntervalId) clearInterval(statsIntervalId);
                             statsIntervalId = setInterval(fetchWorkerStats, 5000);
                             fetchDashboard();
-                            setInterval(fetchDashboard, 10000);
+                            setInterval(fetchDashboard, 8000);
                             toggleStartStopButton();
                             startTimer();
                         }
@@ -1757,7 +2386,7 @@ document.addEventListener('DOMContentLoaded', () => {
                                 if (statsIntervalId) clearInterval(statsIntervalId);
                                 statsIntervalId = setInterval(fetchWorkerStats, 5000);
                                 fetchDashboard();
-                                setInterval(fetchDashboard, 10000);
+                                setInterval(fetchDashboard, 8000);
                                 startTimer();
                             } else if (!data.bot_running && btn.textContent === 'Stop') {
                                 toggleStartStopButton();
@@ -2132,6 +2761,7 @@ document.addEventListener('DOMContentLoaded', () => {
             function saveCurrentSettings() {
                 const settingsData = {
                     apiKey: document.getElementById('api-key').value,
+                    discordWebhook: (document.getElementById('discord-webhook') || {}).value || '',
                     // Add other settings here as needed
                 };
 
@@ -2152,6 +2782,36 @@ document.addEventListener('DOMContentLoaded', () => {
                     });
             }
 
+            var capsolverBalTimer = null;
+            function fetchCapsolverBalance() {
+                const el = document.getElementById('capsolver-balance');
+                if (el) el.textContent = 'Saldo: ...';
+                fetch('http://localhost:8999/capsolver_balance', {
+                    headers: {
+                        'Authorization': `Bearer ${authToken}`
+                    }
+                })
+                    .then(response => response.json())
+                    .then(data => {
+                        if (el) {
+                            el.textContent = (data.balance !== undefined)
+                                ? ('Saldo: $' + data.balance)
+                                : ('Saldo: ' + (data.error || 'error'));
+                        }
+                    })
+                    .catch(error => {
+                        if (el) el.textContent = 'Saldo: sin conexion';
+                    });
+            }
+            document.addEventListener('click', function (e) {
+                if (e.target && e.target.id === 'capsolver-refresh') fetchCapsolverBalance();
+            });
+            document.addEventListener('input', function (e) {
+                if (e.target && e.target.id === 'api-key') {
+                    if (capsolverBalTimer) clearTimeout(capsolverBalTimer);
+                    capsolverBalTimer = setTimeout(fetchCapsolverBalance, 1500);
+                }
+            });
             // Function to load settings when the settings tab is opened
             function loadSettings() {
                 fetch('http://localhost:8999/load_settings', {
@@ -2162,6 +2822,8 @@ document.addEventListener('DOMContentLoaded', () => {
                     .then(response => response.json())
                     .then(data => {
                         document.getElementById('api-key').value = data.apiKey;
+                        if (document.getElementById('discord-webhook')) document.getElementById('discord-webhook').value = data.discordWebhook || '';
+                        fetchCapsolverBalance();
                         // Load other settings as needed
                     })
                     .catch(error => {

@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SpotiFix</title>
+    <title>SpotiFix 4.5.0</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/moment@2.29.1/moment.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-moment@1.0.0"></script>
@@ -129,6 +129,37 @@
             padding: 0;
             width: 100%;
             flex-grow: 1;
+            /* Con 10 apartados la lista no cabe en pantallas bajas: sin esto el
+               boton de abajo se sale del sidebar y no hay forma de alcanzarlo.
+               min-height:0 es necesario para que un hijo flex pueda encogerse
+               por debajo de su contenido y empezar a hacer scroll. */
+            min-height: 0;
+            overflow-y: auto;
+            overflow-x: hidden;
+            scrollbar-width: thin;
+            scrollbar-color: #4f4f4f #1a1a1a;
+            /* Sin box-sizing global, el padding-right-sumaria alwidth:100% y
+               el scrollbar se recortaria contra el borde del sidebar. */
+            box-sizing: border-box;
+            padding-right: 4px;
+        }
+
+        #sidebar ul::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        #sidebar ul::-webkit-scrollbar-track {
+            background: #1a1a1a;
+            border-radius: 4px;
+        }
+
+        #sidebar ul::-webkit-scrollbar-thumb {
+            background: #4f4f4f;
+            border-radius: 4px;
+        }
+
+        #sidebar ul::-webkit-scrollbar-thumb:hover {
+            background: #6a6a6a;
         }
 
         #sidebar li {
@@ -1045,7 +1076,7 @@
 <div class="title-bar">
     <div class="background-image"></div>
     <div class="title">
-        <span id="appVersionLabel" style="margin-left: 10px;">Spotifix</span>
+        <span style="margin-left: 10px;">Spotifix 4.5.0</span>
     </div>
     <div class="title-bar-buttons" style="display: flex; align-items: center;">
         <button id="minimize-btn">
@@ -1072,6 +1103,8 @@
         <li><button id="settingsBtn">Settings</button></li>
         <li><button id="chatBtn">IA</button></li>
         <li><button id="timerBtn">Temporizador</button></li>
+        <li><button id="automatBtn">Automat</button></li>
+        <li><button id="accountcreatBtn">Accountcreat</button></li>
     </ul>
 </div>
 <div id="main-content">
@@ -1453,6 +1486,10 @@
             <form id="settingsForm">
                 <label for="api-key">Capsolver API Key:</label>
                 <input type="text" id="api-key" name="api-key">
+                <br><label for="discord-webhook" style="margin-top:8px;display:inline-block;">Discord Webhook (avisos del lote):</label>
+                <input type="text" id="discord-webhook" name="discord-webhook" placeholder="https://discord.com/api/webhooks/..." style="width:100%;">
+                <span id="capsolver-balance" style="margin-left:10px;font-weight:bold;">Saldo: ...</span>
+                <button type="button" id="capsolver-refresh" title="Actualizar saldo">&#x21bb;</button>
             </form>
         </div>
         <div class="card card-large">
@@ -1495,7 +1532,7 @@
         </div>
         <div class="card card-large">
             <h2>Update</h2>
-            <p class="login-help" id="updateCurrentVersion">Current version: 4.6.6</p>
+            <p class="login-help" id="updateCurrentVersion">Current version: 4.5.0</p>
             <div id="updateStatus" style="margin-bottom: 1rem; min-height: 24px;"></div>
             <div class="form-group">
                 <button id="checkUpdateButton" class="boton-elegante">Check for Updates</button>
@@ -1690,6 +1727,140 @@
             <div id="timerLog" style="max-height: 400px; overflow-y: auto; font-size: 13px; color: #ccc; padding: 10px; background: #1a1a2e; border-radius: 6px; min-height: 100px;">
                 <p style="color: #666;">Sin eventos de temporizador.</p>
             </div>
+        </div>
+    </div>
+    <div id="automat" class="content-tab-scrollable">
+        <div class="card card-large">
+            <h2>Registro de Spotify (ADB)</h2>
+            <p class="login-help">Rellena los datos y pulsa Iniciar. Una cuenta por ejecución. Si Spotify pide
+                CAPTCHA, lo resuelves tú: el script se detiene y lo deja en el móvil.</p>
+            <div class="form-group">
+                <label for="automatEmail">Correo:</label>
+                <input type="text" id="automatEmail" placeholder="correo@dominio.com" autocomplete="off">
+            </div>
+            <div class="form-group">
+                <label for="automatPassword">Contraseña:</label>
+                <input type="password" id="automatPassword" value="Melona3030." autocomplete="off">
+                <p class="login-help" style="margin:0.4rem 0 0 0;">Spotify exige mínimo 10 caracteres.</p>
+            </div>
+        </div>
+        <div class="card card-large">
+            <h2>Fecha de nacimiento</h2>
+            <div class="form-group">
+                <label style="display:flex; align-items:center; gap:0.4rem; cursor:pointer;">
+                    <input type="radio" name="automatDob" id="automatDobRandom" value="random" checked> Aleatoria (adulto, 18-45)
+                </label>
+                <label style="display:flex; align-items:center; gap:0.4rem; cursor:pointer;">
+                    <input type="radio" name="automatDob" id="automatDobManual" value="manual"> Manual:
+                </label>
+            </div>
+            <div class="form-group">
+                <input type="date" id="automatDobDate" disabled>
+                <p class="login-help" style="margin:0.4rem 0 0 0;">Solo adultos: evita teclear por error la fecha de un menor.</p>
+            </div>
+            <div class="form-group">
+                <label style="display:flex; align-items:center; gap:0.4rem; cursor:pointer;">
+                    <input type="checkbox" id="automatSkipDob"> Omitir el campo (elegirla a mano en el móvil)
+                </label>
+                <label style="display:flex; align-items:center; gap:0.4rem; cursor:pointer;">
+                    <input type="checkbox" id="automatRandomGender" checked> Género aleatorio
+                </label>
+            </div>
+        </div>
+        <div class="card card-large">
+            <h2>Personalización</h2>
+            <div class="form-group">
+                <label for="automatArtists">Artistas (separados por coma):</label>
+                <input type="text" id="automatArtists" value="SBrecords" autocomplete="off">
+                <p class="login-help" style="margin:0.4rem 0 0 0;">Los que no existan se avisan y se omiten, sin cortar el flujo.</p>
+            </div>
+            <div class="form-group">
+                <label for="automatMinArtists">Mínimo de artistas a pulsar (0-10):</label>
+                <input type="number" id="automatMinArtists" min="0" max="10" value="3">
+                <p class="login-help" style="margin:0.4rem 0 0 0;">Los nombres explícitos se cuentan primero; el resto se completa al azar de la rejilla.</p>
+            </div>
+        </div>
+        <div class="card card-large">
+            <h2>Dispositivo</h2>
+            <div class="form-group">
+                <label for="automatSerial">Teléfono / emulador (ADB):</label>
+                <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+                    <select id="automatSerial" style="flex:1; min-width:220px;"></select>
+                    <button type="button" id="automatRefresh" class="boton-elegante">Actualizar</button>
+                </div>
+            </div>
+            <div class="form-group">
+                <label style="display:flex; align-items:center; gap:0.4rem; cursor:pointer;">
+                    <input type="checkbox" id="automatSubmit" checked> Enviar el formulario: pulsa 'Crear cuenta' y acepta los Términos de Uso
+                </label>
+                <p class="login-help" style="margin:0.4rem 0 0 0;">Desmarcado, el script se detiene antes de esa pantalla.</p>
+            </div>
+            <div class="form-group" style="display:flex; gap:10px; flex-wrap:wrap;">
+                <button type="button" id="automatStart" class="boton-elegante">Iniciar</button>
+                <button type="button" id="automatCancel" class="boton-elegante" style="background:#e74c3c !important;" disabled>Cancelar</button>
+            </div>
+            <div id="automatStatus" style="margin-top:0.6rem; font-size:0.9rem; color:#aaa;">Listo.</div>
+        </div>
+        <div class="card card-large">
+            <h2>Automatizar (lote)</h2>
+            <p class="login-help">Genera los correos y va registrando las cuentas una a una, repartiéndolas entre
+                los teléfonos conectados. Usa los mismos datos de arriba (contraseña, fecha, artistas...).
+                Cuando Spotify pida verificación humana el lote se para y te espera: resuélvela en el móvil y
+                pulsa Continuar. Las cuentas que terminan sin CAPTCHA se anotan en el log editable de
+                Accountcreat como <code>correo:contraseña</code>.</p>
+            <div class="form-group">
+                <label for="batchCantidad">Cuentas a registrar:</label>
+                <input type="number" id="batchCantidad" min="1" max="10000" value="500">
+            </div>
+            <div class="form-group" style="display:flex; gap:10px; flex-wrap:wrap;">
+                <button type="button" id="batchStart" class="boton-elegante" style="background:#2ecc71 !important; color:#08240f; font-weight:700;">Automatizar</button>
+                <button type="button" id="batchContinue" class="boton-elegante" style="background:#f1c40f !important; color:#3a2c00; font-weight:700;" disabled>Continuar</button>
+                <button type="button" id="batchStop" class="boton-elegante" style="background:#e74c3c !important;" disabled>Detener</button>
+                <button type="button" id="batchExport" class="boton-elegante" style="background:#3498db !important;">Exportar</button>
+                <button type="button" id="batchResume" class="boton-elegante" style="background:#9b59b6 !important;">Reanudar anterior</button>
+            </div>
+            <div id="batchProgress" style="margin-top:0.8rem; font-size:0.9rem; color:#ccc;">
+                <div id="batchStatus" style="color:#aaa;">Listo.</div>
+                <div id="batchCounts" style="margin-top:0.4rem; font-size:0.85rem; color:#888;">
+                    Progreso: 0/0 · correctas: 0 · con CAPTCHA: 0 · con error: 0
+                </div>
+                <div id="batchCurrent" style="margin-top:0.4rem; font-size:0.85rem; color:#888; font-family:Consolas,monospace;"></div>
+            </div>
+        </div>
+        <div class="card card-large">
+            <h2>Log del lote</h2>
+            <div id="batchLog" style="max-height:420px; overflow-y:auto; font-size:13px; font-family:Consolas,monospace; color:#ccc; padding:10px; background:#1a1a2e; border-radius:6px; min-height:180px; white-space:pre-wrap;"></div>
+        </div>
+        <div class="card card-large">
+            <h2>Log</h2>
+            <div id="automatLog" style="max-height:420px; overflow-y:auto; font-size:13px; font-family:Consolas,monospace; color:#ccc; padding:10px; background:#1a1a2e; border-radius:6px; min-height:180px; white-space:pre-wrap;"></div>
+        </div>
+    </div>
+    <div id="accountcreat" class="content-tab-scrollable">
+        <div class="card card-large">
+            <h2>Generador de correos</h2>
+            <p class="login-help">Genera correos falsos con Faker (es_MX), uno por línea. Es para tener
+                direcciones de relleno: no son correos reales y no llegan a ningún sitio.</p>
+            <div class="form-group">
+                <label for="accountcreatCantidad">Cantidad de correos:</label>
+                <input type="number" id="accountcreatCantidad" min="1" max="100000" value="1000">
+            </div>
+            <div class="form-group" style="display:flex; gap:10px; flex-wrap:wrap;">
+                <button type="button" id="accountcreatRun" class="boton-elegante">Generar</button>
+                <button type="button" id="accountcreatCancel" class="boton-elegante" style="background:#e74c3c !important;" disabled>Cancelar</button>
+                <button type="button" id="accountcreatCopy" class="boton-elegante">Copiar todos</button>
+                <button type="button" id="accountcreatSave" class="boton-elegante">Guardar en .txt</button>
+                <button type="button" id="accountcreatClear" class="boton-elegante">Borrar todos</button>
+            </div>
+            <div id="accountcreatStatus" style="margin-top:0.6rem; font-size:0.9rem; color:#aaa;">Listo.</div>
+        </div>
+        <div class="card card-large">
+            <h2>Correos (<span id="accountcreatCount">0</span>)</h2>
+            <p class="login-help">El texto es editable: puedes corregir, reordenar o quitar líneas a mano.
+                Lo que dejes aquí se guarda solo, y sigue ahí aunque cierres la app.</p>
+            <textarea id="accountcreatLog" spellcheck="false" placeholder="Los correos aparecerán aquí, numerados." style="width:100%; box-sizing:border-box; min-height:320px; max-height:320px; overflow-y:auto; resize:vertical; font-size:13px; font-family:Consolas,monospace; color:#ccc; padding:10px; background:#1a1a2e; border:1px solid #444; border-radius:6px; white-space:pre;"></textarea>
+            <div class="login-help" style="margin-top:8px; margin-bottom:4px;">Vista filtrada (solo las que valen): verde = correcta, amarillo = a verificar (quedó en CAPTCHA).</div>
+            <div id="accountcreatList" style="width:100%; box-sizing:border-box; min-height:120px; max-height:320px; overflow-y:auto; padding:10px; background:#121225; border:1px solid #444; border-radius:6px; font-size:13px; font-family:Consolas,monospace; white-space:pre-wrap; line-height:1.6;"></div>
         </div>
     </div>
 </div>
