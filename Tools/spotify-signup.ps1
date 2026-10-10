@@ -704,7 +704,15 @@ try {
     Tap-Ui -Pattern '^(Registrarte gratis|Sign up free)$' -What 'Registrarse gratis'
 
     Write-Host "`n== 2. Metodo de contacto ==" -ForegroundColor Cyan
-    Tap-Ui -Pattern '^(Continuar con correo|Continue with email|Sign up with email)$' -What 'Continuar con correo'
+    # Spotify nuevo salta esta pantalla y va directo al correo: solo se pulsa
+    # el metodo si NO hay ya un campo de correo visible.
+    $yaCorreo = @(Get-UiNodes | Where-Object { $_.Cls -eq 'EditText' -and -not $_.Pwd })
+    if ($yaCorreo.Count -gt 0) {
+        Write-Host '  ya esta en la pantalla de correo: se omite el metodo'
+    }
+    else {
+        Tap-Ui -Pattern '^(Continuar con correo|Continue with email|Sign up with email)$' -What 'Continuar con correo'
+    }
 
     Write-Host "`n== 3. Correo ==" -ForegroundColor Cyan
     $edit = @(Get-UiNodes | Where-Object { $_.Cls -eq 'EditText' -and -not $_.Pwd })

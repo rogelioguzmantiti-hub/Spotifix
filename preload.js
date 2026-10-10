@@ -2,8 +2,8 @@ const { contextBridge, ipcRenderer } = require('electron');
 
 // Define allowed channels for send and receive to ensure security
 const validSendChannels = ['toggle-console', 'toggle-always-on-top', 'minimize-app', 'close-app', 'send-token', 'login-attempt', 'login-success', 'restart-app'];
-const validInvokeChannels = ['ai-status', 'ai-chat', 'ai-reset', 'automat-adb-devices', 'automat-signup-start', 'automat-signup-cancel', 'accountcreat-run', 'accountcreat-cancel', 'accountcreat-save', 'accountcreat-load', 'accountcreat-save-text', 'accountcreat-clear', 'batch-start', 'batch-continue', 'batch-stop', 'batch-export', 'batch-resume', 'batch-resume-info'];
-const validReceiveChannels = ['console-toggled', 'token-received', 'login-response', 'ai-progress', 'automat-signup-log', 'automat-signup-done', 'accountcreat-log', 'accountcreat-done', 'batch-event'];
+const validInvokeChannels = ['ai-status', 'ai-chat', 'ai-reset', 'automat-adb-devices', 'automat-signup-start', 'automat-signup-cancel', 'accountcreat-run', 'accountcreat-cancel', 'accountcreat-save', 'accountcreat-load', 'accountcreat-save-text', 'accountcreat-clear', 'batch-start', 'batch-continue', 'batch-stop', 'batch-export', 'batch-resume', 'batch-resume-info', 'vpn-usa-all', 'brave-start', 'brave-stop'];
+const validReceiveChannels = ['console-toggled', 'token-received', 'login-response', 'ai-progress', 'vpn-event', 'brave-event', 'automat-signup-log', 'automat-signup-done', 'accountcreat-log', 'accountcreat-done', 'batch-event'];
 
 contextBridge.exposeInMainWorld('electronAPI', {
     saveSettings: (settings) => ipcRenderer.send('save-settings', settings),
@@ -181,6 +181,38 @@ contextBridge.exposeInMainWorld('electronAPI', {
             return ipcRenderer.invoke('batch-resume');
         }
         return Promise.resolve({ ok: false });
+    },
+    vpnUsaAll: () => {
+        if (validInvokeChannels.includes('vpn-usa-all')) {
+            return ipcRenderer.invoke('vpn-usa-all');
+        }
+        return Promise.resolve({ ok: false });
+    },
+    onVpnEvent: (callback) => {
+        if (validReceiveChannels.includes('vpn-event')) {
+            const listener = (event, data) => callback(data);
+            ipcRenderer.on('vpn-event', listener);
+            return () => ipcRenderer.removeListener('vpn-event', listener);
+        }
+    },
+    braveStart: (payload) => {
+        if (validInvokeChannels.includes('brave-start')) {
+            return ipcRenderer.invoke('brave-start', payload);
+        }
+        return Promise.resolve({ ok: false });
+    },
+    braveStop: () => {
+        if (validInvokeChannels.includes('brave-stop')) {
+            return ipcRenderer.invoke('brave-stop');
+        }
+        return Promise.resolve({ ok: true });
+    },
+    onBraveEvent: (callback) => {
+        if (validReceiveChannels.includes('brave-event')) {
+            const listener = (event, data) => callback(data);
+            ipcRenderer.on('brave-event', listener);
+            return () => ipcRenderer.removeListener('brave-event', listener);
+        }
     },
     batchResumeInfo: () => {
         if (validInvokeChannels.includes('batch-resume-info')) {

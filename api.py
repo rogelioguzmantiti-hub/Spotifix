@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 import threading
 
 from httpcore import ProxyError
@@ -89,7 +89,7 @@ db = SQLAlchemy(app)
 
 Bot_name = "Spotifix"
 global_bot_name = "SpotiFix"
-Bot_version = "4.5.1"
+Bot_version = "4.5.2"
 GITHUB_REPO = "rogelioguzmantiti-hub/Spotifix"
 backend_state = 'Initializing...'
 akey = 'jonex program key'.encode('utf-8')
@@ -1899,6 +1899,144 @@ def get_worker_stats():
         "worker_bot_errors": worker_bot_errors
     })
 
+
+_vpn_state = {}
+_vpn_check_ts = {}
+
+def _vpn_state_file():
+    try:
+        d = os.path.join(project_dir, "Files")
+        os.makedirs(d, exist_ok=True)
+        return os.path.join(d, "vpn_state.json")
+    except Exception:
+        return None
+
+def _vpn_state_load():
+    try:
+        f = _vpn_state_file()
+        if f and os.path.exists(f):
+            with open(f, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict):
+                _vpn_state.update(data)
+    except Exception:
+        pass
+
+def _vpn_state_save():
+    try:
+        f = _vpn_state_file()
+        if f:
+            with open(f, "w", encoding="utf-8") as fh:
+                json.dump(_vpn_state, fh)
+    except Exception:
+        pass
+
+_vpn_state_load()
+
+_geo_cache = {}
+
+def _tunnel_server_ip(udid):
+    """IP del servidor VPN (flujo WireGuard exterior). No intrusivo. None si no hay."""
+    try:
+        import subprocess as _sp
+        r = _sp.run([adb_path, "-s", udid, "shell", "cat", "/proc/net/nf_conntrack"],
+                    capture_output=True, text=True, timeout=20)
+        out = r.stdout or ""
+        if "dport=51820" not in out and "udp" not in out:
+            _sp.run([adb_path, "-s", udid, "root"], capture_output=True, timeout=20)
+            r = _sp.run([adb_path, "-s", udid, "shell", "cat", "/proc/net/nf_conntrack"],
+                        capture_output=True, text=True, timeout=20)
+            out = r.stdout or ""
+        for ln in out.splitlines():
+            if " udp " not in ln or "[ASSURED]" not in ln:
+                continue
+            m = re.search(r"src=(\S+) dst=(\S+) sport=\S+ dport=(\d+)", ln)
+            if not m:
+                continue
+            s, d, port = m.group(1), m.group(2), m.group(3)
+            if s.startswith("10.14.") or s.startswith("127.") or d.startswith("10.") or d.startswith("192.168."):
+                continue
+            if port == "53":
+                continue
+            return d
+    except Exception:
+        pass
+    return None
+
+def _geo_ip(ip):
+    if not ip:
+        return "", ""
+    if ip in _geo_cache:
+        return _geo_cache[ip]
+    cc, city = "", ""
+    for url in ("https://ipinfo.io/%s/json" % ip, "https://ipapi.co/%s/json/" % ip):
+        try:
+            import urllib.request as _u
+            with _u.urlopen(url, timeout=8) as r:
+                d = json.loads(r.read().decode())
+            cc = d.get("country_code") or d.get("country") or ""
+            city = d.get("city") or d.get("region") or ""
+            if cc:
+                break
+        except Exception:
+            continue
+    _geo_cache[ip] = (cc, city)
+    return cc, city
+
+def _device_vpn_live(udid):
+    """VPN en vivo por dispositivo: {on, location, ip}. No intrusivo (conntrack + ip route)."""
+    now = __import__("time").time()
+    st = _vpn_state.get(udid, {})
+    last = _vpn_check_ts.get(udid, 0)
+    on = st.get("on")
+    if now - last > 10:
+        try:
+            import subprocess as _sp
+            r = _sp.run([adb_path, "-s", udid, "shell", "ip", "route"],
+                        capture_output=True, text=True, timeout=15)
+            tun = "tun" in (r.stdout or "")
+            srv = _tunnel_server_ip(udid) if tun else None
+            on = bool(tun and srv)
+            if srv:
+                cc, city = _geo_ip(srv)
+                if cc == "US":
+                    st["location"] = (city + ", USA") if city else "USA"
+                    st["ip"] = srv
+                elif cc:
+                    st["location"] = (city + ", " + cc) if city else cc
+                    st["ip"] = srv
+        except Exception:
+            pass
+        _vpn_check_ts[udid] = now
+        if on is not None:
+            st["on"] = on
+            _vpn_state[udid] = st
+            _vpn_state_save()
+    return {"on": bool(st.get("on", False)),
+            "location": st.get("location") or "?",
+            "ip": st.get("ip") or "?"}
+
+@app.route('/device_vpn_set', methods=['POST'])
+@require_token
+def device_vpn_set():
+    try:
+        d = request.json or {}
+        udid = d.get("udid", "")
+        if not udid:
+            return jsonify({"error": "udid requerido"}), 400
+        st = _vpn_state.get(udid, {})
+        if d.get("location"):
+            st["location"] = d["location"]
+        if d.get("ip"):
+            st["ip"] = d["ip"]
+        if "on" in d:
+            st["on"] = bool(d["on"])
+        _vpn_state[udid] = st
+        _vpn_state_save()
+        return jsonify({"ok": True}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/get_dashboard', methods=['GET'])
 @require_token
 def get_dashboard():
@@ -1918,12 +2056,33 @@ def get_dashboard():
         devices_status.append({
             'udid': udid_base,
             'panda_number': panda_num,
+            'vpn': _device_vpn_live(udid_base),
             'thread_key': key,
             'status': thread.get('status', ''),
             'streams': thread.get('streams', 0),
             'errors': thread.get('errors', 0),
             'session_time': thread.get('session_time', 0),
         })
+
+    try:
+        import subprocess as _sp2
+        _r = _sp2.run([adb_path, "devices"], capture_output=True, text=True, timeout=15)
+        for _ln in (_r.stdout or "").splitlines():
+            _p = _ln.strip().split()
+            if len(_p) >= 2 and _p[1] == "device" and _p[0] not in seen_udids:
+                seen_udids.add(_p[0])
+                devices_status.append({
+                    "udid": _p[0],
+                    "panda_number": panda_map.get(_p[0], None),
+                    "thread_key": "",
+                    "status": "idle",
+                    "streams": 0,
+                    "errors": 0,
+                    "session_time": 0,
+                    "vpn": _device_vpn_live(_p[0]),
+                })
+    except Exception:
+        pass
 
     app_states = []
     active_apps_per_udid = {}
@@ -6735,52 +6894,95 @@ def _tap_super_proxy_start(udid):
     return False
 
 
+SURFSHARK_PKG = "com.surfshark.vpnclient.android"
+
+def _check_surfshark_usa(udid):
+    """True si el tunel VPN esta activo y el servidor es USA. Rapido (~10s)."""
+    try:
+        import subprocess as _sp
+        r = _sp.run([adb_path, "-s", udid, "shell", "ip", "route"],
+                    capture_output=True, text=True, timeout=15,
+                    startupinfo=startupinfo)
+        if "tun" not in (r.stdout or ""):
+            return False, "sin tun"
+        srv = _tunnel_server_ip(udid)
+        if not srv:
+            return False, "sin tunel"
+        cc, city = _geo_ip(srv)
+        if cc == "US":
+            return True, "%s %s" % (city or "USA", srv)
+        return False, "pais=%s %s" % (cc or "?", srv)
+    except Exception as e:
+        return False, str(e)[:80]
+
+def _rotate_surfshark_usa(udid):
+    """Corre Tools/surf_rotate.py para poner USA. Devuelve (ok, detalle)."""
+    try:
+        import subprocess as _sp
+        env = dict(os.environ)
+        env["SPOTIFIX_ADB"] = adb_path
+        script = os.path.join(_bundle_app_dir(), "Tools", "surf_rotate.py")
+        if not os.path.exists(script):
+            script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Tools", "surf_rotate.py")
+        r = _sp.run(["python", script, udid], capture_output=True, text=True,
+                    timeout=600, startupinfo=startupinfo, env=env)
+        out = (r.stdout or "") + (r.stderr or "")
+        import re as _re
+        m = _re.search(r"SURF-OK\s+(\S+)\s+(\S+)\s+(\S+)", out)
+        if m:
+            try:
+                _vpn_state[udid] = {"on": True, "location": m.group(1) + ", USA", "ip": m.group(2)}
+                _vpn_state_save()
+            except Exception:
+                pass
+            return True, "%s %s" % (m.group(1), m.group(2))
+        m2 = _re.search(r"SURF-FAIL\s+(.*)", out)
+        return False, ((m2.group(1) if m2 else "ver log").strip()[:80])
+    except Exception as e:
+        return False, str(e)[:80]
+
 def _validate_device_proxy(udid, proxy, connection_type):
     if not config_validate_proxy:
         add_log("WARN", udid, "[Proxy] validate_proxy is DISABLED in config. Skipping validation.")
         return True
-    add_log("INFO", udid, "[Proxy] Opening Super Proxy to validate 4x before apps (config_validate_proxy=True)...")
+    add_log("INFO", udid, "[Proxy] Validando Surfshark USA 4 rondas (config_validate_proxy=True)...")
 
     connected_rounds = 0
     for vround in range(1, 5):
         if _stop_requested(udid):
             add_log("WARN", udid, "[Proxy] Stop requested during proxy validation.")
             return False
-        _open_super_proxy(udid)
-        time.sleep(1)
-        if _check_super_proxy_ui(udid):
+        ok, detail = _check_surfshark_usa(udid)
+        if ok:
             connected_rounds += 1
-            add_log("SUCC", udid, f"[Proxy] VALIDATION {vround}/4: CONNECTED ({connected_rounds}/4 rounds ok)")
+            add_log("SUCC", udid, f"[Proxy] VALIDATION {vround}/4: USA ({detail}, {connected_rounds}/4 rounds ok)")
             time.sleep(2)
             continue
-        add_log("WARN", udid, f"[Proxy] VALIDATION {vround}/4: NOT connected, attempting to start...")
+        add_log("WARN", udid, f"[Proxy] VALIDATION {vround}/4: no USA ({detail}), rotando...")
         rectified = False
         for attempt in range(1, 6):
             if _stop_requested(udid):
                 return False
-            _open_super_proxy(udid)
-            time.sleep(1)
-            _tap_super_proxy_start(udid)
-            time.sleep(5)
-            if _check_super_proxy_ui(udid):
+            ok2, det2 = _rotate_surfshark_usa(udid)
+            if ok2:
                 connected_rounds += 1
-                add_log("SUCC", udid, f"[Proxy] RECTIFIED on attempt {attempt} (round {vround}/4, {connected_rounds}/4 rounds ok)")
+                add_log("SUCC", udid, f"[Proxy] RECTIFIED on attempt {attempt} (round {vround}/4, {det2})")
                 rectified = True
                 time.sleep(2)
                 break
-            add_log("WARN", udid, f"[Proxy] Rectify attempt {attempt}/5 (round {vround}/4) failed, retrying...")
+            add_log("WARN", udid, f"[Proxy] Rectify attempt {attempt}/5 (round {vround}/4) failed ({det2}), retrying...")
             time.sleep(2)
         if not rectified:
-            msg = f"Super Proxy FAILED the {vround}/4 validation round (could NOT connect within 5 attempts) on device {udid}. Device will be skipped."
+            msg = f"Surfshark USA FAILED the {vround}/4 validation round on device {udid}. Device will be skipped."
             _send_proxy_alert(udid, proxy, msg)
             proxy_blocked_devices.add(udid)
             add_log("ERR.", udid, "[Proxy] Validation failed. Skipping device.")
             return False
 
     if connected_rounds >= 4:
-        add_log("SUCC", udid, f"[Proxy] Validated CONNECTED in {connected_rounds}/4 rounds. Proceeding to launch apps.")
+        add_log("SUCC", udid, f"[Proxy] Validated USA in {connected_rounds}/4 rounds. Proceeding to launch apps.")
         return True
-    add_log("ERR.", udid, f"[Proxy] Only {connected_rounds}/4 rounds connected. Failing validation.")
+    add_log("ERR.", udid, f"[Proxy] Only {connected_rounds}/4 rounds USA. Failing validation.")
     proxy_blocked_devices.add(udid)
     return False
 
@@ -6789,25 +6991,23 @@ def _recheck_device_proxy(udid, proxy, connection_type):
     if not config_validate_proxy:
         return True
     for rcheck_round in range(1, 3):
-        if _check_super_proxy_ui(udid):
-            add_log("SUCC", udid, f"[Proxy] RECHECK {rcheck_round}/2: CONNECTED")
+        ok, detail = _check_surfshark_usa(udid)
+        if ok:
+            add_log("SUCC", udid, f"[Proxy] RECHECK {rcheck_round}/2: USA ({detail})")
             return True
-        add_log("WARN", udid, f"[Proxy] RECHECK {rcheck_round}/2: NOT connected, attempting to start...")
+        add_log("WARN", udid, f"[Proxy] RECHECK {rcheck_round}/2: no USA ({detail}), rotando...")
         rectified = False
         for attempt in range(1, 6):
-            _open_super_proxy(udid)
-            time.sleep(1)
-            _tap_super_proxy_start(udid)
-            time.sleep(5)
-            if _check_super_proxy_ui(udid):
-                add_log("SUCC", udid, f"[Proxy] RECHECK reconnected on attempt {attempt} (round {rcheck_round}/2)")
+            ok2, det2 = _rotate_surfshark_usa(udid)
+            if ok2:
+                add_log("SUCC", udid, f"[Proxy] RECHECK USA on attempt {attempt} (round {rcheck_round}/2, {det2})")
                 rectified = True
                 break
-            add_log("WARN", udid, f"[Proxy] Recheck attempt {attempt}/5 (round {rcheck_round}/2) failed, retrying...")
+            add_log("WARN", udid, f"[Proxy] Recheck attempt {attempt}/5 (round {rcheck_round}/2) failed ({det2}), retrying...")
             time.sleep(2)
         if rectified:
             return True
-    msg = f"Super Proxy DISCONNECTED and failed to reconnect after 2 rounds (5 attempts each) on device {udid}. Device stopped."
+    msg = f"Surfshark USA DISCONNECTED and failed to reconnect after 2 rounds (5 attempts each) on device {udid}. Device stopped."
     _send_proxy_alert(udid, proxy, msg)
     proxy_blocked_devices.add(udid)
     apps_to_close = ['com.spotify.music', 'com.aspiro.tidal', 'com.apple.android.music']
@@ -7878,6 +8078,7 @@ INSTALL_APKS = {
     },
     'sound_assistant_9_11': os.path.join(_bundle_app_dir(), 'apk', 'SoundAssistant_1.3.5.14.1.apk'),
     'sound_assistant_12_14': os.path.join(_bundle_app_dir(), 'apk', 'SoundAssistant.apk'),
+    'surfshark': os.path.join(_bundle_app_dir(), 'apk', 'Surfshark.apk'),
 }
 
 @app.route('/install_apps', methods=['POST'])
@@ -8624,3 +8825,4 @@ def install_update():
 
 if __name__ == '__main__':
     app.run(port=8999, debug=False)
+

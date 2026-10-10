@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Menu, Tray, ipcMain, dialog } = require('electron');
+﻿const { app, BrowserWindow, Menu, Tray, ipcMain, dialog } = require('electron');
 const { spawn, exec } = require('child_process');
 const fs = require('fs');
 const path = require('path');
@@ -407,6 +407,135 @@ if (!gotTheLock) {
         discordNotify('Spotifix lote reanudado: ' + r.queue.length + ' pendientes.');
         batchRunNext();
         return { ok: true, total: r.queue.length, devices: devs };
+    });
+
+    ipcMain.handle('vpn-usa-all', async () => {
+        const adb = findAdb();
+        if (!adb) return { ok: false, error: "No se encontro 'adb.exe'." };
+        const devs = await new Promise((resolve) => {
+            exec('"' + adb + '" devices', { windowsHide: true, timeout: 20000 }, (err, stdout) => {
+                const list = [];
+                String(stdout || '').split(/\r?\n/).forEach((raw) => {
+                    const line = raw.trim();
+                    if (!line || line.startsWith('List of devices') || line.startsWith('*')) return;
+                    const parts = line.split(/\s+/);
+                    if (parts.length >= 2 && parts[1] === 'device') list.push(parts[0]);
+                });
+                resolve(list);
+            });
+        });
+        if (!devs.length) return { ok: false, error: 'adb no ve ningun telefono listo.' };
+        const sender = batchSender();
+        const emit = (texto) => batchNotify(sender, 'vpn-event', { texto: texto });
+        emit('VPN USA: iniciando en ' + devs.length + ' dispositivo(s)...');
+        discordNotify('Spotifix VPN USA: iniciando en ' + devs.length + ' dispositivo(s).');
+        const script = path.join(appPath, 'Tools', 'surf_rotate.py');
+        const results = await Promise.all(devs.map((dev) => new Promise((resolve) => {
+            emit('[' + dev + '] conectando USA...');
+            exec('python "' + script + '" "' + dev + '"', { windowsHide: true, timeout: 720000 }, async (err, stdout) => {
+                const out = String(stdout || '');
+                const okm = out.match(/SURF-OK\s+(\S+)\s+(\S+)\s+(\S+)/);
+                if (okm) {
+                    try {
+                        const reg = await axios.post('http://127.0.0.1:8999/register', { username: 'local' }, { timeout: 15000 });
+                        if (reg.data && reg.data.token) {
+                            await axios.post('http://127.0.0.1:8999/device_vpn_set', { udid: dev, location: okm[1] + ', USA', ip: okm[2], on: true }, { headers: { Authorization: 'Bearer ' + reg.data.token }, timeout: 15000 });
+                        }
+                    } catch (e) {}
+                    emit('[' + dev + '] OK: ' + okm[1] + ' ' + okm[2]);
+                    resolve({ dev: dev, ok: true, detail: okm[1] + ' ' + okm[2] });
+                } else {
+                    const fm = out.match(/SURF-FAIL\s+(.*)/);
+                    emit('[' + dev + '] FALLO: ' + ((fm && fm[1]) || 'ver log').trim());
+                    resolve({ dev: dev, ok: false, detail: ((fm && fm[1]) || 'error').trim() });
+                }
+            });
+        })));
+        const okN = results.filter((r) => r.ok).length;
+        emit('VPN USA terminado: ' + okN + '/' + results.length + ' en USA.');
+        discordNotify('Spotifix VPN USA terminado: ' + okN + '/' + results.length + ' en USA.\n' + results.map((r) => (r.ok ? 'OK ' : 'FAIL ') + r.dev + ' ' + r.detail).join('\n'));
+        return { ok: true, results: results };
+    });
+
+    let brave = null;
+    function braveNotify(sender, type, data) {
+        if (sender && !sender.isDestroyed()) sender.send('brave-event', { type: type, data: data });
+    }
+    async function braveRunNext() {
+        if (!brave || brave.stopped) return;
+        if (brave.proc) return;
+        if (brave.index >= brave.queue.length) {
+            const b = brave;
+            const resumen = 'Brave terminado: ' + b.ok + ' correcta(s), ' + b.fail + ' con error.';
+            const exp = exportBatchResults(b.items, resumen);
+            braveNotify(batchSender(), 'log', { texto: '  [export] ' + exp });
+            braveNotify(batchSender(), 'finished', { resumen: resumen + ' ' + exp });
+            discordNotify('Spotifix Brave terminado: ' + resumen + '\n' + exp);
+            brave = null;
+            return;
+        }
+        const email = brave.queue[brave.index];
+        const sender = batchSender();
+        braveNotify(sender, 'item-start', { email: email, indice: brave.index + 1, total: brave.queue.length });
+        const args = ['Tools/spotify-brave.py', '--email', email, '--password', brave.password, '--random-dob', '--gender', 'random', '--profile', 'auto'];
+        const p2 = spawn('python', args, { cwd: appPath, windowsHide: true });
+        brave.proc = p2;
+        let out = '';
+        const onData = (buf) => {
+            const s = String(buf);
+            out += s;
+            braveNotify(sender, 'log', s);
+        };
+        p2.stdout.setEncoding('utf8');
+        p2.stderr.setEncoding('utf8');
+        p2.stdout.on('data', onData);
+        p2.stderr.on('data', onData);
+        p2.on('error', (err) => {
+            braveNotify(sender, 'log', '\nError al arrancar Python: ' + err.message + '\n');
+            if (brave) brave.proc = null;
+        });
+        p2.on('close', (code) => {
+            if (!brave) return;
+            brave.proc = null;
+            let resultado = 'error', detalle = 'codigo ' + code;
+            if (/^OK\s+/m.test(out)) { resultado = 'ok'; detalle = ''; brave.ok++; }
+            else if (/CAPTCHA_NO_RESUELTO/.test(out)) { resultado = 'captcha'; detalle = 'captcha sin resolver'; brave.fail++; }
+            else { brave.fail++; }
+            brave.items.push({ email: email, resultado: resultado, detalle: detalle, proxy: 'brave-local', hora: new Date().toISOString() });
+            appendBatchResult(email, brave.password, resultado === 'ok' ? 'ok' : 'captcha');
+            braveNotify(sender, 'item', { email: email, resultado: resultado, detalle: detalle });
+            brave.index++;
+            setTimeout(() => { braveRunNext(); }, 500);
+        });
+    }
+    ipcMain.handle('brave-start', async (event, payload) => {
+        if (brave) return { ok: false, error: 'Ya hay un lote Brave en marcha.' };
+        const p = payload || {};
+        const cantidad = parseInt(p.cantidad, 10);
+        if (isNaN(cantidad) || cantidad < 1) return { ok: false, error: 'Cantidad no valida.' };
+        if (cantidad > 60) return { ok: false, error: 'Maximo 60 (perfiles Brave).' };
+        if (!p.password || p.password.length < 10) return { ok: false, error: 'Contrasena de 10+ caracteres.' };
+        const sender = batchSender();
+        braveNotify(sender, 'phase', 'Generando ' + cantidad + ' correo(s)...');
+        const gen = await runPythonEmails(cantidad);
+        if (!gen.ok) return { ok: false, error: gen.error };
+        if (!gen.emails.length) return { ok: false, error: 'No se genero ningun correo.' };
+        brave = { queue: gen.emails, index: 0, password: p.password, proc: null, stopped: false, items: [], ok: 0, fail: 0 };
+        braveNotify(sender, 'phase', 'Brave iniciado: ' + gen.emails.length + ' cuenta(s).');
+        discordNotify('Spotifix Brave iniciado: ' + gen.emails.length + ' cuenta(s).');
+        braveRunNext();
+        return { ok: true, total: gen.emails.length };
+    });
+    ipcMain.handle('brave-stop', async () => {
+        if (!brave) return { ok: true };
+        brave.stopped = true;
+        if (brave.proc && !brave.proc.killed) { try { treeKill(brave.proc.pid, 'SIGTERM', () => {}); } catch (e) {} }
+        const b = brave;
+        const resumen = 'Brave detenido: ' + b.ok + ' correcta(s), ' + b.fail + ' con error.';
+        const exp = exportBatchResults(b.items, resumen);
+        brave = null;
+        braveNotify(batchSender(), 'finished', { resumen: resumen + ' ' + exp, parcial: true });
+        return { ok: true };
     });
 
     app.on('before-quit', () => {
@@ -1088,7 +1217,19 @@ function accountcreatStateFile() {
         });
     }
 
+    let batchPrecheckGpsMsg = '';
     async function checkDeviceVpnUsa(adb, device) {
+        try {
+            const gps = path.join(appPath, 'Tools', 'surf_gps.py');
+            const gout = await new Promise((resolve) => {
+                exec('python "' + gps + '" "' + device + '"', { windowsHide: true, timeout: 180000 }, (err, stdout) => {
+                    resolve(String(stdout || ''));
+                });
+            });
+            const gm = gout.match(/GPS-(OK|FAIL)\s*(.*)/);
+            if (gm) batchPrecheckGpsMsg = 'GPS override: ' + gm[1] + ' ' + (gm[2] || '');
+        } catch (e) { batchPrecheckGpsMsg = 'GPS override: no verificado'; }
+
         const route = await execOut('"' + adb + '" -s "' + device + '" shell ip route', 15000);
         if (route.out.indexOf('tun') === -1) {
             return { ok: false, detalle: device + ': sin VPN (no hay interfaz tun). Enciende Surfshark en USA.' };
@@ -1136,55 +1277,33 @@ function accountcreatStateFile() {
 
     async function batchPrecheck(adb, devices) {
         const lines = [];
-        for (const d of devices) {
-            const v = await checkDeviceVpnUsa(adb, d);
-            lines.push('  [vpn] ' + v.detalle);
-            if (!v.ok) return { ok: false, error: v.detalle, report: lines.join('\n') };
-        }
         const bal = await checkCapsolverBalance();
         lines.push('  [capsolver] saldo: ' + (bal.ok ? ('$' + bal.balance) : bal.detalle));
         if (!bal.ok) return { ok: false, error: 'CapSolver: ' + bal.detalle, report: lines.join('\n') };
-        const raw = loadBatchProxies();
-        const good = [];
-        if (raw.length > 0) {
-            for (const line of raw) {
-                const c = await checkProxyUsa(line);
-                lines.push('  [proxy] ' + line.split(':').slice(0, 2).join(':') + ' -> ' + (c.ok ? ('USA OK (' + c.detalle.trim() + ')') : c.detalle));
-                if (c.ok) good.push({ line: line, label: line.split(':').slice(0, 2).join(':') });
-            }
-            if (good.length === 0) return { ok: false, error: 'proxies.txt sin proxies USA utilizables.', report: lines.join('\n') };
-        } else {
-            lines.push('  [proxy] sin proxies.txt: se usa la VPN del equipo (Surfshark USA).');
-        }
-        return { ok: true, report: lines.join('\n'), proxies: good };
+        return { ok: true, report: lines.join('\n'), proxies: [] };
     }
 
     async function cycleDeviceVpn(adb, device) {
+        const script = path.join(appPath, 'Tools', 'surf_rotate.py');
+        const runOne = () => new Promise((resolve) => {
+            exec('python "' + script + '" "' + device + '"', { windowsHide: true, timeout: 600000 }, (err, stdout) => {
+                resolve(String(stdout || '') + (err ? '\nERR:' + err.message : ''));
+            });
+        });
         try {
-            await execOut('"' + adb + '" -s "' + device + '" shell monkey -p com.surfshark.vpnclient.android -c android.intent.category.LAUNCHER 1', 20000);
-            await sleep(4000);
-            const dump = await execOut('"' + adb + '" -s "' + device + '" shell uiautomator dump /sdcard/_vpn.xml', 20000);
-            const cat = await execOut('"' + adb + '" -s "' + device + '" shell cat /sdcard/_vpn.xml', 15000);
-            await execOut('"' + adb + '" -s "' + device + '" shell rm -f /sdcard/_vpn.xml', 10000);
-            const nodes = [];
-            const re = /<node\b[^>]*>/g;
-            let mm;
-            while ((mm = re.exec(cat.out || '')) !== null) {
-                const n = mm[0];
-                const t = (/text="([^"]*)"/.exec(n) || [])[1] || '';
-                const b = /bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"/.exec(n);
-                if (b) nodes.push({ text: t, x: (parseInt(b[1]) + parseInt(b[3])) / 2, y: (parseInt(b[2]) + parseInt(b[4])) / 2 });
+            const out = await runOne();
+            const m = out.match(/SURF-OK\s+(\S+)\s+(\S+)\s+(\S+)/);
+            if (m) {
+                try {
+                    const reg = await axios.post('http://127.0.0.1:8999/register', { username: 'local' }, { timeout: 15000 });
+                    if (reg.data && reg.data.token) {
+                        await axios.post('http://127.0.0.1:8999/device_vpn_set', { udid: device, location: m[1] + ', USA', ip: m[2], on: true }, { headers: { Authorization: 'Bearer ' + reg.data.token }, timeout: 15000 });
+                    }
+                } catch (e) {}
+                return 'IP renovada USA (' + m[1] + ' ' + m[2] + ').';
             }
-            const tog = nodes.find((n) => /connected|conectado|disconnect|quick connect|conectar/i.test(n.text));
-            if (tog) {
-                await execOut('"' + adb + '" -s "' + device + '" shell input tap ' + Math.round(tog.x) + ' ' + Math.round(tog.y), 15000);
-                await sleep(3000);
-                await execOut('"' + adb + '" -s "' + device + '" shell input tap ' + Math.round(tog.x) + ' ' + Math.round(tog.y), 15000);
-                await sleep(6000);
-            }
-            const route = await execOut('"' + adb + '" -s "' + device + '" shell ip route', 15000);
-            if (route.out.indexOf('tun') !== -1) return 'IP renovada (reconexion Surfshark).';
-            return 'sin cambio verificado, se continua igual.';
+            const f = out.match(/SURF-FAIL\s+(.*)/);
+            return 'sin cambio (' + ((f && f[1]) || 'ver log').trim().slice(0, 80) + '), se continua igual.';
         } catch (e) { return 'no se pudo rotar (' + e.message + '), se continua igual.'; }
     }
 
@@ -1512,7 +1631,7 @@ function accountcreatStateFile() {
             return { ok: false, error: 'adb no ve ningun telefono listo.' };
         }
 
-        batchNotify(sender, 'phase', 'Prechequeo: VPN USA + saldo CapSolver + proxies...');
+        batchNotify(sender, 'phase', 'Prechequeo: VPN USA + saldo CapSolver...');
         const pre = await batchPrecheck(adb, devices);
         batchNotify(sender, 'log', { texto: pre.report });
         if (!pre.ok) {
@@ -1655,4 +1774,5 @@ function accountcreatStateFile() {
         }
     }
 }
+
 

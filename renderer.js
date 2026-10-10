@@ -1008,6 +1008,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     if (document.getElementById('installAppleCheck').checked) apps.push('apple_music');
                     if (document.getElementById('installSA911Check').checked) apps.push('sound_assistant_9_11');
                     if (document.getElementById('installSA1214Check').checked) apps.push('sound_assistant_12_14');
+                    if (document.getElementById('installSurfsharkCheck').checked) apps.push('surfshark');
                     if (!apps.length) {
                         resultDiv.innerHTML = '<p style="color: orange;">Selecciona al menos una app.</p>';
                         return;
@@ -1159,7 +1160,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 chatBtn: 'chat',
                 timerBtn: 'timer',
                 automatBtn: 'automat',
-                accountcreatBtn: 'accountcreat'
+                accountcreatBtn: 'accountcreat',
+                braveBtn: 'brave'
             };
 
             Object.keys(sidebarButtons).forEach(buttonId => {
@@ -1496,29 +1498,54 @@ document.addEventListener('DOMContentLoaded', () => {
                 dobManualEl.addEventListener('change', updateDobState);
                 skipDobEl.addEventListener('change', updateDobState);
 
+                let pandaMap = {};
+                function paintResolved() {
+                    const info = document.getElementById('automatSerialResolved');
+                    const v = (serialEl.value || '').trim();
+                    const hit = resolvePanda(v);
+                    if (info) {
+                        if (!v) { info.textContent = ''; info.style.color = '#888'; }
+                        else if (hit) { info.textContent = '→ ' + hit.serial + ' (' + (hit.model || 'sin modelo') + ')'; info.style.color = '#2ecc71'; }
+                        else { info.textContent = 'Número no encontrado. Pulsa Actualizar.'; info.style.color = '#e74c3c'; }
+                    }
+                }
+                function resolvePanda(v) {
+                    v = (v || '').trim();
+                    if (!v) return null;
+                    if (pandaMap[v]) return pandaMap[v];
+                    const m = v.match(/^(\d+)/);
+                    if (m && pandaMap[m[1]]) return pandaMap[m[1]];
+                    return null;
+                }
                 function refreshDevices() {
-                    setStatus('Buscando dispositivos adb...', false);
-                    api.automatDevices().then((res) => {
-                        if (!res || !res.ok) {
-                            setStatus((res && res.error) || 'No se pudieron listar los dispositivos.', true);
-                            return;
-                        }
-                        const current = serialEl.value;
-                        serialEl.innerHTML = '';
-                        res.devices.forEach((d) => {
-                            const opt = document.createElement('option');
-                            opt.value = d;
-                            opt.textContent = d;
-                            serialEl.appendChild(opt);
+                    setStatus('Buscando numeración Panda...', false);
+                    fetch('http://localhost:8999/panda_numbers', {
+                        headers: { 'Authorization': `Bearer ${authToken}` }
+                    }).then((res) => res.json()).then((data) => {
+                        pandaMap = {};
+                        const dl = document.getElementById('pandaList');
+                        if (dl) dl.innerHTML = '';
+                        (data.numbers || []).forEach((p) => {
+                            pandaMap[String(p.num)] = p;
+                            if (dl) {
+                                const opt = document.createElement('option');
+                                opt.value = String(p.num);
+                                opt.textContent = p.num + ' — ' + (p.model || '') + ' (' + p.serial + ')';
+                                dl.appendChild(opt);
+                            }
                         });
-                        if (current && res.devices.indexOf(current) !== -1) serialEl.value = current;
-                        if (res.devices.length === 0) {
-                            setStatus('adb no ve ningun dispositivo listo. Enciende el telefono.', true);
+                        paintResolved();
+                        const n = (data.numbers || []).length;
+                        if (n === 0) {
+                            setStatus('No hay teléfonos con numeración Panda. Revisa Panda/adb.', true);
                         } else {
-                            setStatus('Listo. ' + res.devices.length + ' dispositivo(s) detectado(s).', false);
+                            setStatus('Listo. ' + n + ' teléfono(s) con numeración Panda.', false);
                         }
+                    }).catch((err) => {
+                        setStatus('No se pudo leer la numeración: ' + err.message, true);
                     });
                 }
+                serialEl.addEventListener('input', paintResolved);
 
                 if (refreshEl) refreshEl.addEventListener('click', refreshDevices);
 
@@ -1554,19 +1581,21 @@ document.addEventListener('DOMContentLoaded', () => {
                             passEl.focus();
                             return;
                         }
-                        if (!serialEl.value) {
-                            setStatus('Selecciona un dispositivo.', true);
+                        const hit = resolvePanda(serialEl.value);
+                        if (!hit) {
+                            setStatus('Escribe un número Panda válido (pulsa Actualizar para ver la lista).', true);
+                            serialEl.focus();
                             return;
                         }
 
                         setStatus('Ejecutando... no cierres Spotify a mano.', false);
                         logEl.textContent = '';
-                        appendLog('$ adb -s ' + serialEl.value + '  spotify-signup.ps1\n\n');
+                        appendLog('$ adb -s ' + hit.serial + '  spotify-signup.ps1\n\n');
 
                         api.automatStart({
                             email: email,
                             password: password,
-                            serial: serialEl.value,
+                            serial: hit.serial,
                             dobMode: dobRandomEl.checked ? 'random' : 'manual',
                             dobDate: dobDateEl.value,
                             skipDob: skipDobEl.checked,
@@ -1599,6 +1628,117 @@ document.addEventListener('DOMContentLoaded', () => {
 
                 setRunning(false);
                 refreshDevices();
+            })();
+
+            // ---- Brave: lote en navegador local ----
+            (function () {
+                const api = window.electronAPI;
+                const startEl = document.getElementById('braveStart');
+                if (!api || !startEl) return;
+                const cantidadEl = document.getElementById('braveCantidad');
+                const passEl = document.getElementById('bravePassword');
+                const stopEl = document.getElementById('braveStop');
+                const statusEl = document.getElementById('braveStatus');
+                const countsEl = document.getElementById('braveCounts');
+                const currentEl = document.getElementById('braveCurrent');
+                const logEl = document.getElementById('braveLog');
+                let active = false;
+                let counts = { ok: 0, fail: 0, total: 0 };
+                function setStatus(t, c) { if (statusEl) { statusEl.textContent = t; statusEl.style.color = c || '#aaa'; } }
+                function setCounts() { if (countsEl) countsEl.textContent = 'Progreso: ' + (counts.ok + counts.fail) + '/' + counts.total + ' · correctas: ' + counts.ok + ' · con error: ' + counts.fail; }
+                function appendLog(t) { if (!logEl) return; logEl.textContent += t; logEl.scrollTop = logEl.scrollHeight; }
+                function setActive(on) {
+                    active = on;
+                    if (startEl) startEl.disabled = on;
+                    if (stopEl) stopEl.disabled = !on;
+                    if (cantidadEl) cantidadEl.disabled = on;
+                }
+                startEl.addEventListener('click', () => {
+                    if (active) return;
+                    const cantidad = parseInt(cantidadEl.value, 10);
+                    if (isNaN(cantidad) || cantidad < 1 || cantidad > 60) { setStatus('Cantidad 1-60.', '#e74c3c'); return; }
+                    if (!passEl.value || passEl.value.length < 10) { setStatus('Contrasena de 10+ caracteres.', '#e74c3c'); return; }
+                    counts = { ok: 0, fail: 0, total: cantidad };
+                    setCounts();
+                    if (logEl) logEl.textContent = '';
+                    if (currentEl) currentEl.textContent = '';
+                    setActive(true);
+                    braveSessionPass = passEl.value;
+                    api.braveStart({ cantidad: cantidad, password: passEl.value }).then((res) => {
+                        if (!res || !res.ok) { setStatus((res && res.error) || 'No se pudo iniciar.', '#e74c3c'); setActive(false); return; }
+                        counts.total = res.total;
+                        setCounts();
+                    });
+                });
+                if (stopEl) stopEl.addEventListener('click', () => {
+                    if (!active) return;
+                    api.braveStop();
+                });
+                const accEl = document.getElementById('braveAccounts');
+                const accCountEl = document.getElementById('braveAccCount');
+                let braveSessionPass = '';
+                function braveAccCount() {
+                    if (!accEl) return;
+                    const n = accEl.value.split('\n').map((s) => s.trim()).filter((s) => s.length > 0).length;
+                    if (accCountEl) accCountEl.textContent = n;
+                    try { localStorage.setItem('braveAccounts', accEl.value); } catch (e) {}
+                }
+                function braveAccAdd(email, pass) {
+                    if (!accEl) return;
+                    const line = email + ':' + pass;
+                    accEl.value = accEl.value.replace(/\s+$/, '') + (accEl.value.trim() ? '\n' : '') + line + '\n';
+                    braveAccCount();
+                }
+                if (accEl) {
+                    try { accEl.value = localStorage.getItem('braveAccounts') || ''; } catch (e) {}
+                    braveAccCount();
+                    accEl.addEventListener('input', braveAccCount);
+                    const dl = (name, text, type) => {
+                        const a = document.createElement('a');
+                        a.href = URL.createObjectURL(new Blob([text], { type: type || 'text/plain' }));
+                        a.download = name;
+                        a.click();
+                        setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+                    };
+                    const zin = () => {
+                        const d = new Date();
+                        const p = (n) => String(n).padStart(2, '0');
+                        return d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '_' + p(d.getHours()) + p(d.getMinutes());
+                    };
+                    document.getElementById('braveCopy').addEventListener('click', () => { navigator.clipboard.writeText(accEl.value); setStatus('Copiado.', '#2ecc71'); });
+                    document.getElementById('braveSaveTxt').addEventListener('click', () => { dl('brave_' + zin() + '.txt', accEl.value); });
+                    document.getElementById('braveExportCsv').addEventListener('click', () => {
+                        const rows = ['email;password'];
+                        accEl.value.split('\n').forEach((ln) => {
+                            const t = ln.trim();
+                            if (!t) return;
+                            const i = t.indexOf(':');
+                            rows.push(i < 0 ? t + ';' : t.slice(0, i) + ';' + t.slice(i + 1));
+                        });
+                        dl('brave_' + zin() + '.csv', rows.join('\n'), 'text/csv');
+                    });
+                    document.getElementById('braveClearAcc').addEventListener('click', () => {
+                        if (!confirm('Borrar la lista de cuentas creadas?')) return;
+                        accEl.value = '';
+                        braveAccCount();
+                    });
+                }
+                api.onBraveEvent((ev) => {
+                    if (!ev) return;
+                    const type = ev.type, d = ev.data || {};
+                    if (type === 'phase') { setStatus(d, '#f1c40f'); appendLog('\n' + d + '\n'); }
+                    else if (type === 'log') { appendLog(typeof d === 'string' ? d : (d.texto || '')); }
+                    else if (type === 'item-start') {
+                        if (currentEl) currentEl.textContent = '(' + d.indice + '/' + d.total + ') ' + d.email;
+                        appendLog('\n===== (' + d.indice + '/' + d.total + ') ' + d.email + ' =====\n');
+                    }
+                    else if (type === 'item') {
+                        if (d.resultado === 'ok') { counts.ok++; appendLog('>> OK: ' + d.email + '\n'); braveAccAdd(d.email, braveSessionPass); }
+                        else { counts.fail++; appendLog('>> ERROR en ' + d.email + ': ' + (d.detalle || '') + '\n'); }
+                        setCounts();
+                    }
+                    else if (type === 'finished') { setActive(false); if (currentEl) currentEl.textContent = ''; setStatus(d.resumen, '#2ecc71'); appendLog('\n' + d.resumen + '\n'); }
+                });
             })();
 
             // ---- Accountcreat: generador de correos ----
@@ -2029,7 +2169,7 @@ document.addEventListener('DOMContentLoaded', () => {
                         return;
                     }
                     if (type === 'log') {
-                        appendLog(d);
+                        appendLog(typeof d === 'string' ? d : ((d && d.texto) || ''));
                         return;
                     }
                     if (type === 'item') {
@@ -2287,8 +2427,6 @@ document.addEventListener('DOMContentLoaded', () => {
                             fetchWorkerStats();
                             if (statsIntervalId) clearInterval(statsIntervalId);
                             statsIntervalId = setInterval(fetchWorkerStats, 5000);
-                            fetchDashboard();
-                            setInterval(fetchDashboard, 8000);
                             toggleStartStopButton();
                             startTimer();
                         }
@@ -2385,8 +2523,7 @@ document.addEventListener('DOMContentLoaded', () => {
                                 fetchWorkerStats();
                                 if (statsIntervalId) clearInterval(statsIntervalId);
                                 statsIntervalId = setInterval(fetchWorkerStats, 5000);
-                                fetchDashboard();
-                                setInterval(fetchDashboard, 8000);
+
                                 startTimer();
                             } else if (!data.bot_running && btn.textContent === 'Stop') {
                                 toggleStartStopButton();
@@ -2478,10 +2615,15 @@ document.addEventListener('DOMContentLoaded', () => {
                         }
                         const mins = dev.session_time ? Math.round(dev.session_time / 60) : 0;
                         const pandaLabel = dev.panda_number ? `${dev.panda_number}` : dev.udid;
+                        const vpn = dev.vpn || {};
+                        const vpnBg = vpn.on ? 'rgba(168,85,247,0.15)' : 'rgba(239,68,68,0.15)';
+                        const vpnColor = vpn.on ? '#a855f7' : '#ef4444';
+                        const vpnTxt = vpn.on ? (`${vpn.location || '?'} · ${vpn.ip || '?'}`) : 'VPN apagada';
                         html += `<div class="dash-app-card">
                             <div class="dash-device-header">
                                 <div class="dash-device-name">${pandaLabel} <span class="dash-device-udid">${dev.udid}</span></div>
                                 <div class="dash-device-udid">Streams: <span>${dev.streams || 0}</span> | Errors: <span>${dev.errors || 0}</span> | Up: <span>${mins}m</span></div>
+                                <div style="margin-top:6px;font-size:1rem;font-weight:700;background:${vpnBg};border:1px solid ${vpnColor};border-radius:10px;padding:8px 12px;">📍 <span style="color:${vpnColor};">${vpnTxt}</span></div>
                             </div>
                             ${appsHtml}
                         </div>`;
@@ -2492,6 +2634,34 @@ document.addEventListener('DOMContentLoaded', () => {
                 }
             }
 
+            if (!window._dashLive) {
+                window._dashLive = true;
+                fetchDashboard();
+                setInterval(fetchDashboard, 8000);
+            }
+            (function () {
+                const api = window.electronAPI;
+                const btn = document.getElementById('vpnUsaButton');
+                const st = document.getElementById('vpnUsaStatus');
+                if (!api || !btn) return;
+                const set = (t) => { if (st) st.textContent = t; };
+                if (api.onVpnEvent) {
+                    api.onVpnEvent((d) => {
+                        if (d && d.texto) set(((st && st.textContent) ? st.textContent + '\n' : '') + d.texto);
+                    });
+                }
+                btn.addEventListener('click', () => {
+                    if (!confirm('Prende Surfshark y pone USA en todos los telefonos detectados. Tarda varios minutos. Continuar?')) return;
+                    btn.disabled = true;
+                    set('Iniciando...');
+                    api.vpnUsaAll().then((res) => {
+                        btn.disabled = false;
+                        if (!res || !res.ok) { set((res && res.error) || 'Error.'); return; }
+                        const lines = (res.results || []).map((x) => (x.ok ? 'OK ' : 'FAIL ') + x.dev + ' ' + x.detail);
+                        set('Terminado:\n' + lines.join('\n'));
+                    });
+                });
+            })();
             function toggleStartStopButton() {
                 const button = document.getElementById('startStopButton');
                 if (button.textContent === 'Start') {
