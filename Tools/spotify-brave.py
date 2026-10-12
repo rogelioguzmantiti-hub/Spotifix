@@ -42,6 +42,15 @@ def user_data_dir():
     return d if os.path.isdir(d) else None
 
 
+def profile_locked(udd, name):
+    for lock in ("SingletonSocket", "SingletonLock", "lockfile", "SingletonCookie"):
+        try:
+            if os.path.exists(os.path.join(udd, name, lock)):
+                return True
+        except Exception:
+            pass
+    return False
+
 def list_profiles(udd):
     out = []
     try:
@@ -51,6 +60,10 @@ def list_profiles(udd):
     except Exception:
         pass
     return out
+
+def free_profiles(udd, used):
+    return [pr for pr in list_profiles(udd)
+            if pr not in used and not profile_locked(udd, pr)]
 
 
 def load_state():
@@ -78,15 +91,49 @@ def capsolver_key():
         return ""
 
 
+def browser_ua(driver):
+    try:
+        return driver.execute_script("return navigator.userAgent;")
+    except Exception:
+        return ""
+
+_PROXY = None
+def _pick_proxy():
+    global _PROXY
+    if globals().get("_BROWSER_PX"):
+        return globals()["_BROWSER_PX"]
+    try:
+        import proxy_pool
+        px = proxy_pool.next_proxy()
+        if px:
+            _PROXY = px
+            return px
+    except Exception as e:
+        log("  [proxy] pool no disponible: %s" % e)
+    return _PROXY
+
 def capsolver_create(website_url, website_key, enterprise, **kwargs):
     key = capsolver_key()
     if not key:
         log("  [captcha] sin CapSolver API key en settings")
         return None
-    ttype = "ReCaptchaV2EnterpriseTaskProxyLess" if enterprise else "ReCaptchaV2TaskProxyLess"
-    task = {"type": ttype, "websiteURL": website_url, "websiteKey": website_key}
+    px = _pick_proxy()
+    if px:
+        try:
+            import proxy_pool
+            ttype = "ReCaptchaV2EnterpriseTask" if enterprise else "ReCaptchaV2Task"
+            task = {"type": ttype, "websiteURL": website_url, "websiteKey": website_key}
+            task.update(proxy_pool.capsolver_proxy_fields(px))
+            log("  [proxy] resolviendo via %s (%s)" % (px[0], px[1]))
+        except Exception:
+            px = None
+    if not px:
+        ttype = "ReCaptchaV2EnterpriseTaskProxyLess" if enterprise else "ReCaptchaV2TaskProxyLess"
+        task = {"type": ttype, "websiteURL": website_url, "websiteKey": website_key}
     if kwargs.get("invisible"):
         task["isInvisible"] = True
+    if kwargs.get("userAgent"):
+        task["userAgent"] = kwargs["userAgent"]
     payload = {"clientKey": key, "task": task}
     try:
         r = json.loads(U.urlopen(U.Request("https://api.capsolver.com/createTask",
@@ -148,7 +195,7 @@ def presolve_captcha(driver):
         log("  [captcha] sin sitekey en pagina")
         return True
     log("  [captcha] pre-solve sitekey %s... enterprise=%s" % (sk[:12], ent))
-    tid = capsolver_create(driver.current_url, sk, ent, invisible=True)
+    tid = capsolver_create(driver.current_url, sk, ent, invisible=True, userAgent=browser_ua(driver))
     if not tid:
         return True
     token = capsolver_poll(tid)
@@ -156,6 +203,47 @@ def presolve_captcha(driver):
         return True
     inject_token(driver, token)
     return True
+
+def try_real_checkbox(driver, wait_s=20):
+    """Clic REAL al checkbox (IP residencial propia). True si se marco."""
+    import time as _t
+    try:
+        boxes = driver.find_elements("xpath", "//iframe[contains(@src,'recaptcha')]")
+        if not boxes:
+            return False
+        anchor = None
+        for f in boxes:
+            s = f.get_attribute("src") or ""
+            if "anchor" in s:
+                anchor = f
+                break
+        if anchor is None:
+            anchor = boxes[0]
+        driver.switch_to.frame(anchor)
+        try:
+            cb = driver.find_element("xpath", "//*[@id='recaptcha-anchor' or @class='recaptcha-checkbox']")
+            cb.click()
+            log("  [captcha] clic real al checkbox")
+        finally:
+            driver.switch_to.default_content()
+        _t.sleep(wait_s)
+        tok = driver.execute_script(
+            "var t=document.querySelector('#g-recaptcha-response');return t?t.value:'';");
+        if tok and len(tok) > 20:
+            log("  [captcha] checkbox marcado solo (%d chars)" % len(tok))
+            return True
+        # si salio reto de imagenes, no lo tocamos
+        imgs = driver.find_elements("xpath", "//iframe[contains(@src,'recaptcha')]")
+        if len(imgs) > 1:
+            log("  [captcha] salio reto de imagenes: se deja pendiente")
+        return False
+    except Exception as e:
+        try:
+            driver.switch_to.default_content()
+        except Exception:
+            pass
+        log("  [captcha] clic real fallo: %s" % str(e)[:100])
+        return False
 
 def solve_page_captcha(driver):
     """Si hay reCAPTCHA visible, lo resuelve e inyecta. True si no habia o se resolvio."""
@@ -172,7 +260,7 @@ def solve_page_captcha(driver):
     sitekey = mk.group(1)
     enterprise = "enterprise" in src
     log("  [captcha] sitekey %s... enterprise=%s" % (sitekey[:12], enterprise))
-    tid = capsolver_create(driver.current_url, sitekey, enterprise)
+    tid = capsolver_create(driver.current_url, sitekey, enterprise, userAgent=browser_ua(driver))
     if not tid:
         return False
     token = capsolver_poll(tid)
@@ -231,10 +319,13 @@ def main():
 
     if a.profile == "auto":
         st = load_state()
-        free = [p for p in profiles if p not in st.get("used", [])]
+        free = free_profiles(udd, st.get("used", []))
         if not free:
-            print("ERROR: los %d perfiles ya se usaron (borra brave_profiles.json para reutilizar)" % len(profiles))
-            return 1
+            free = [p for p in profiles if p not in st.get("used", [])]
+            if not free:
+                print("ERROR: los %d perfiles ya se usaron (borra brave_profiles.json para reutilizar)" % len(profiles))
+                return 1
+            log("aviso: todos los libres estan bloqueados, se intenta el primero usado-libre")
         profile = free[0]
     else:
         profile = a.profile
@@ -270,9 +361,31 @@ def main():
     opts.add_argument("--profile-directory=%s" % profile)
     opts.add_argument("--disable-blink-features=AutomationControlled")
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    _rpx = _pick_proxy()
+    if _rpx:
+        try:
+            import relay as _relay
+            _rport = _relay.start_relay(_rpx[0], int(_rpx[1]), _rpx[2], _rpx[3])
+            opts.add_argument("--proxy-server=http://127.0.0.1:%d" % _rport)
+            opts.add_argument("--proxy-bypass-list=localhost,127.0.0.1")
+            globals()["_BROWSER_PX"] = _rpx
+            log("  [proxy] navegador via %s" % _rpx[0])
+        except Exception as _e:
+            log("  [proxy] relay fallo: %s" % _e)
     if a.headless:
         opts.add_argument("--headless=new")
-    driver = webdriver.Chrome(options=opts)
+    try:
+        driver = webdriver.Chrome(options=opts)
+    except Exception as e:
+        log("reintentando arranque (limpiando procesos sueltos)...")
+        try:
+            import subprocess as _sp
+            _sp.run(["taskkill", "/F", "/IM", "chromedriver.exe"],
+                    capture_output=True, timeout=20)
+        except Exception:
+            pass
+        time.sleep(3)
+        driver = webdriver.Chrome(options=opts)
     wait = WebDriverWait(driver, 30)
     try:
         log("== 1. Correo ==")
@@ -326,8 +439,8 @@ def main():
         time.sleep(1)
         presolve_captcha(driver)
         ok_markers = ["open.spotify.com", "account/overview", "download", "signup/login"]
-        for intento in range(1, 4):
-            btns = driver.find_elements(By.XPATH, "//button[contains(., 'Sign up') or contains(., 'Crear') or contains(., 'Regist')]")
+        for intento in range(1, 3):
+            btns = driver.find_elements(By.XPATH, "//button[contains(., 'Sign up') or contains(., 'Crear') or contains(., 'Regist') or contains(., 'Continuar') or contains(., 'Continue') or contains(., 'Verificar') or contains(., 'Verify')]")
             if btns:
                 try:
                     btns[0].click()
@@ -345,7 +458,10 @@ def main():
             if ("captcha" in body or "robot" in body or "verifica" in body
                     or "challenge" in url
                     or driver.find_elements(By.XPATH, "//iframe[contains(@src,'recaptcha')]")):
-                log("  [captcha] reto detectado, resolviendo (intento %d)" % intento)
+                log("  [captcha] reto detectado, clic real primero (intento %d)" % intento)
+                if "challenge.spotify.com" not in url and try_real_checkbox(driver):
+                    continue
+                log("  [captcha] token CapSolver (intento %d)" % intento)
                 if not solve_page_captcha(driver):
                     print("CAPTCHA_NO_RESUELTO")
                     return 2
@@ -354,6 +470,10 @@ def main():
 
         url = driver.current_url
         log("url final: %s" % url)
+        if "challenge.spotify.com" in url:
+            log("PENDIENTE: reto no superado, se deja para resolver a mano")
+            print("PENDIENTE %s" % a.email)
+            return 0
         if "open.spotify.com" in url or "account/overview" in url or "signup#step=3" not in url and "challenge" not in url:
             pass
         ok_markers = ["open.spotify.com", "account/overview", "download", "signup/login"]

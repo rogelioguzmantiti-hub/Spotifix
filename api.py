@@ -89,7 +89,7 @@ db = SQLAlchemy(app)
 
 Bot_name = "Spotifix"
 global_bot_name = "SpotiFix"
-Bot_version = "4.5.3"
+Bot_version = "4.5.4"
 GITHUB_REPO = "rogelioguzmantiti-hub/Spotifix"
 backend_state = 'Initializing...'
 akey = 'jonex program key'.encode('utf-8')
@@ -239,6 +239,12 @@ config_tidal_links_batch_id = ''
 config_apple_links_batch_id = ''
 config_proxies_batch_id = ''
 config_session_time = ''
+config_rotation_hours = '4-6'
+config_accounts_per_device = 7
+config_rotar_cuentas = True
+config_stock_target = 10
+_last_phone_creation = 0.0
+DEFAULT_SIGNUP_PASSWORD = 'Melona3030.'
 config_stay_logged_in = False
 config_accounts_batch_id = ''
 config_use_webhook = False
@@ -1723,6 +1729,19 @@ def start_stop_bot():
             config_tidal_links_batch_id = config_data.get('tidal_links_batch_id', '')
             config_apple_links_batch_id = config_data.get('apple_links_batch_id', '')
             config_session_time = config_data.get('session_time') or '8-8'
+            global config_rotation_hours, config_accounts_per_device, config_rotar_cuentas, config_stock_target
+            config_rotation_hours = config_data.get('rotation_hours') or '4-6'
+            try:
+                config_accounts_per_device = int(config_data.get('accounts_per_device', 7))
+            except Exception:
+                config_accounts_per_device = 7
+            config_rotar_cuentas = config_data.get('rotar_cuentas', True)
+            if isinstance(config_rotar_cuentas, str):
+                config_rotar_cuentas = config_rotar_cuentas.lower() not in ('false', '0', 'no', 'off')
+            try:
+                config_stock_target = int(config_data.get('stock_target', 10))
+            except Exception:
+                config_stock_target = 10
             config_shuffle_perc = int(config_data.get('shuffle_perc'))
             config_search_links_perc = int(config_data.get('search_links_perc'))
 
@@ -2489,9 +2508,15 @@ def solve_spotify_captcha(udid):
             return False
 
         sitekey = '6LeO36obAAAAALSBZrY6RYM1hcAY7RLvpDDcJLy3'
-        payload = {'clientKey': settings_capsolver_api_key,
-                   'task': {'type': 'ReCaptchaV2EnterpriseTaskProxyLess',
-                            'websiteURL': page_url, 'websiteKey': sitekey}}
+        try:
+            _ua = eval_js(ws_url, "navigator.userAgent", 10)
+        except Exception:
+            _ua = None
+        _task = {'type': 'ReCaptchaV2EnterpriseTaskProxyLess',
+                 'websiteURL': page_url, 'websiteKey': sitekey}
+        if _ua:
+            _task['userAgent'] = _ua
+        payload = {'clientKey': settings_capsolver_api_key, 'task': _task}
         req = _urlreq.Request('https://api.capsolver.com/createTask',
                               data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json'})
         r = json.loads(_urlreq.urlopen(req, timeout=60).read().decode())
@@ -7735,6 +7760,317 @@ def single_clone_automation_flow(d, udid, spotify_pkgs, session_time_seconds, se
     d.app_stop(spotify_pkgs[0] if spotify_pkgs else pkg)
 
 
+def _pool_file(udid):
+    safe = "".join(c if c.isalnum() else "_" for c in str(udid))
+    d = os.path.join(project_dir, "Files", "pools")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+    return os.path.join(d, safe + ".json")
+
+def pool_accounts(udid):
+    try:
+        with open(_pool_file(udid), encoding="utf-8") as f:
+            data = json.load(f)
+        accs = data.get("accounts", [])
+        return [a for a in accs if isinstance(a, str) and ":" in a]
+    except Exception:
+        return []
+
+def pool_save(udid, accounts, idx=0):
+    try:
+        with open(_pool_file(udid), "w", encoding="utf-8") as f:
+            json.dump({"accounts": accounts, "idx": idx}, f)
+    except Exception:
+        pass
+
+def pool_next(udid):
+    accs = pool_accounts(udid)
+    if not accs:
+        return None
+    try:
+        with open(_pool_file(udid), encoding="utf-8") as f:
+            idx = int(json.load(f).get("idx", 0))
+    except Exception:
+        idx = 0
+    acc = accs[idx % len(accs)]
+    pool_save(udid, accs, (idx + 1) % len(accs))
+    return acc
+
+def pool_add(udid, account):
+    accs = pool_accounts(udid)
+    if account not in accs:
+        accs.append(account)
+        pool_save(udid, accs)
+
+def pool_remove(udid, account):
+    accs = [a for a in pool_accounts(udid) if a != account]
+    pool_save(udid, accs)
+
+def green_accounts():
+    """Cuentas VERDES (correctas) del Accountcreat: lineas email:pass sin '(verificar)'."""
+    import re as _re
+    paths = [
+        os.path.join(os.getenv("APPDATA", ""), "Spotifix", "correos.json"),
+        os.path.join(project_dir, "correos.json"),
+    ]
+    text = ""
+    for fp in paths:
+        try:
+            with open(fp, encoding="utf-8") as f:
+                text = json.load(f).get("text", "")
+            if text:
+                break
+        except Exception:
+            continue
+    out = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line or "(verificar)" in line.lower():
+            continue
+        m = _re.match(r"^([^@\s]+@[^@\s]+\.[^@\s]+):(.+)$", line)
+        if m and m.group(2).strip():
+            out.append("%s:%s" % (m.group(1).strip(), m.group(2).strip()))
+    return out
+
+def create_account_now(password=None):
+    """Crea 1 cuenta via Brave local. Devuelve 'email:pass' o None."""
+    pw = password or DEFAULT_SIGNUP_PASSWORD
+    try:
+        from faker import Faker
+        email = Faker("es_MX").email()
+    except Exception:
+        import time as _t
+        email = "user%d@example.org" % int(_t.time())
+    try:
+        import subprocess as _sp
+        base = os.path.dirname(os.path.abspath(__file__))
+        script = os.path.join(base, "Tools", "spotify-brave.py")
+        if not os.path.exists(script):
+            script = os.path.join(base, "spotify-brave.py")
+        add_log("INFO", "", "[Rotacion] Creando cuenta %s en Brave..." % email)
+        r = _sp.run(["python", script, "--email", email, "--password", pw,
+                     "--random-dob", "--gender", "random", "--profile", "auto"],
+                    capture_output=True, text=True, timeout=900)
+        out = (r.stdout or "") + (r.stderr or "")
+        import re as _re
+        m = _re.search(r"^OK\s+(\S+)", out, _re.MULTILINE)
+        if m:
+            add_log("SUCC", "", "[Rotacion] Cuenta creada: %s" % m.group(1))
+            return "%s:%s" % (m.group(1), pw)
+        add_log("WARN", "", "[Rotacion] No se pudo crear %s" % email)
+        return None
+    except Exception as e:
+        add_log("ERR.", "", "[Rotacion] Excepcion creando cuenta: %s" % e)
+        return None
+
+_creation_lock = None
+def _creation_gap_ok(min_seconds=1200):
+    global _last_phone_creation
+    try:
+        import threading as _th
+        global _creation_lock
+        if _creation_lock is None:
+            _creation_lock = _th.Lock()
+    except Exception:
+        return True
+    ok = False
+    try:
+        if _creation_lock.acquire(blocking=False):
+            try:
+                import time as _tt
+                if _tt.time() - _last_phone_creation >= min_seconds:
+                    _last_phone_creation = _tt.time()
+                    ok = True
+            finally:
+                _creation_lock.release()
+    except Exception:
+        pass
+    return ok
+
+def create_account_phone(udid, password=None):
+    """Crea 1 cuenta EN EL TELEFONO via ps1. Devuelve 'email:pass' o None."""
+    if not _creation_gap_ok():
+        add_log("INFO", udid, "[Rotacion] Creacion en telefono en espera (ritmo anti-bloqueo).")
+        return None
+    pw = password or DEFAULT_SIGNUP_PASSWORD
+    try:
+        from faker import Faker
+        email = Faker("es_MX").email()
+    except Exception:
+        import time as _tt
+        email = "user%d@example.org" % int(_tt.time())
+    try:
+        import subprocess as _sp
+        base = os.path.dirname(os.path.abspath(__file__))
+        script = os.path.join(base, "Tools", "spotify-signup.ps1")
+        env = dict(os.environ)
+        env["SPOTIFY_SIGNUP_PASSWORD"] = pw
+        env["SPOTIFY_SIGNUP_GUI"] = "1"
+        add_log("INFO", udid, "[Rotacion] Creando %s en el telefono..." % email)
+        r = _sp.run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                     "-File", script, "-Email", email, "-RandomAdultBirthday",
+                     "-RandomGender", "-Serial", udid, "-SubmitSignup",
+                     "-MinArtists", "3"],
+                    capture_output=True, text=True, timeout=1500, env=env)
+        out = (r.stdout or "") + (r.stderr or "")
+        if "== CAPTCHA ==" in out:
+            add_log("WARN", udid, "[Rotacion] %s pidio CAPTCHA en telefono (pendiente)" % email)
+            return None
+        if "== Terminado ==" in out:
+            add_log("SUCC", udid, "[Rotacion] Cuenta creada en telefono: %s" % email)
+            return "%s:%s" % (email, pw)
+        add_log("WARN", udid, "[Rotacion] ps1 sin exito para %s" % email)
+        return None
+    except Exception as e:
+        add_log("ERR.", udid, "[Rotacion] Excepcion creando en telefono: %s" % e)
+        return None
+
+def stock_count():
+    try:
+        return len(green_accounts())
+    except Exception:
+        return 0
+
+def ensure_stock(max_new=1):
+    """Crea stock en Brave si hay menos del objetivo. Max max_new por llamada."""
+    try:
+        target = int(config_stock_target)
+    except Exception:
+        target = 10
+    have = stock_count()
+    if have >= target:
+        return 0
+    made = 0
+    for _ in range(max_new):
+        if stock_count() >= target:
+            break
+        nuevo = create_account_now()
+        if not nuevo:
+            break
+        try:
+            cur = []
+            for fp in (os.path.join(os.getenv("APPDATA", ""), "Spotifix", "correos.json"),
+                       os.path.join(project_dir, "correos.json")):
+                try:
+                    with open(fp, encoding="utf-8") as f:
+                        cur = json.load(f).get("text", "")
+                    cfp = fp
+                    break
+                except Exception:
+                    continue
+            else:
+                continue
+            if nuevo not in cur:
+                cur = (cur.rstrip() + "\n" + nuevo + "\n") if cur.strip() else (nuevo + "\n")
+                with open(cfp, "w", encoding="utf-8") as f:
+                    json.dump({"text": cur}, f)
+                made += 1
+        except Exception:
+            pass
+    if made:
+        add_log("INFO", "", "[Stock] +%d verde(s) de Brave (stock=%d/%d)" % (made, stock_count(), target))
+    return made
+
+def rotation_hours():
+    try:
+        a, b = str(config_rotation_hours).split("-")
+        lo, hi = float(a), float(b)
+        if hi < lo:
+            lo, hi = hi, lo
+        return random.uniform(lo, hi)
+    except Exception:
+        return random.uniform(4, 6)
+
+def _logout_device(udid):
+    try:
+        import subprocess as _sp
+        _sp.run([adb_path, "-s", udid, "shell", "am", "force-stop", "com.spotify.music"],
+                capture_output=True, timeout=60)
+        _sp.run([adb_path, "-s", udid, "shell", "pm", "clear", "com.spotify.music"],
+                capture_output=True, timeout=90)
+        return True
+    except Exception as e:
+        add_log("WARN", udid, "[Rotacion] logout fallo: %s" % e)
+        return False
+
+def _set_binded_account(udid, account):
+    try:
+        with app.app_context():
+            dev = Device.query.filter_by(udid=udid).first()
+            if dev:
+                dev.bindedAccount = account
+                db.session.commit()
+    except Exception:
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
+
+def rotate_device_account(d, udid):
+    """Cierra sesion, elige/siembra siguiente cuenta del pool y hace login.
+    Devuelve la cuenta activa o None."""
+    if not pool_accounts(udid) and binded_account_seed(udid):
+        pool_add(udid, binded_account_seed(udid))
+    for _ in range(3):
+        acc = pool_next(udid)
+        if not acc:
+            acc = create_account_now()
+            if not acc:
+                return None
+            pool_add(udid, acc)
+        _logout_device(udid)
+        try:
+            ok, msg = spotify_login(d, acc, udid)
+        except Exception as e:
+            ok, msg = False, str(e)
+        if ok:
+            _set_binded_account(udid, acc)
+            # rellena el pool: PRIMERO verdes del Accountcreat hasta el objetivo;
+            # si hay menos de 5, crea en Brave hasta llegar a 5
+            try:
+                target = int(config_accounts_per_device)
+            except Exception:
+                target = 7
+            for g in green_accounts():
+                if len(pool_accounts(udid)) >= target:
+                    break
+                if g not in pool_accounts(udid):
+                    pool_add(udid, g)
+            fallos_seg = 0
+            while len(pool_accounts(udid)) < min(5, target):
+                nuevo = create_account_phone(udid)
+                if not nuevo:
+                    nuevo = create_account_now()
+                if nuevo:
+                    pool_add(udid, nuevo)
+                    add_log("INFO", udid, "[Rotacion] Pool con %d (minimo 5)" % len(pool_accounts(udid)))
+                    fallos_seg = 0
+                else:
+                    fallos_seg += 1
+                    if fallos_seg >= 2:
+                        break
+            # stock global en Brave (no bloquea el ciclo)
+            try:
+                ensure_stock(max_new=1)
+            except Exception:
+                pass
+            return acc
+        add_log("WARN", udid, "[Rotacion] Login fallo con %s (%s), se descarta" % (acc.split(":")[0], msg))
+        pool_remove(udid, acc)
+    return None
+
+def binded_account_seed(udid):
+    try:
+        with app.app_context():
+            dev = Device.query.filter_by(udid=udid).first()
+            if dev and dev.bindedAccount and dev.bindedAccount.strip() not in ("", "/"):
+                return dev.bindedAccount.strip()
+    except Exception:
+        pass
+    return None
+
 def thread_function(udid, binded_account, binded_proxy, connection_type, account_type, app_key='spotify'):
     thread_key = f"{udid}_{app_key}"
     app_info = SUPPORTED_APPS.get(app_key, SUPPORTED_APPS['spotify'])
@@ -7755,11 +8091,35 @@ def thread_function(udid, binded_account, binded_proxy, connection_type, account
             else:
                 spotify_pkgs = [pkg]
                 num_pkgs = 1
-            session_time_hours = 24.0 / num_pkgs
+
+            # --- rotacion de cuenta por ciclo (solo si esta activa) ---
+            # jitter anti-sincronia: ningun telefono rota a la misma hora que otro
+            _stagger_done = getattr(thread_function, "_stagger_%s" % udid.replace("-", "_"), False)
+            if not _stagger_done:
+                _sw = random.uniform(0, 300)
+                add_log("INFO", udid, "[Rotacion] Arranque escalonado %.0fs para no sincronizar." % _sw)
+                time.sleep(_sw)
+                setattr(thread_function, "_stagger_%s" % udid.replace("-", "_"), True)
+            jitter_h = random.uniform(-0.5, 0.5)
+            if config_rotar_cuentas:
+                ciclo_account = rotate_device_account(d, udid)
+                if not ciclo_account:
+                    add_log("WARN", udid, "[Rotacion] Sin cuenta disponible, reintento en 10 min.")
+                    time.sleep(600)
+                    continue
+                add_log("INFO", udid, f"[{display_name}] Cuenta activa: {ciclo_account.split(':')[0]}")
+            else:
+                ciclo_account = binded_account
+                add_log("INFO", udid, f"[{display_name}] Rotacion apagada, cuenta fija.")
+
+            rot_h = rotation_hours()
+            session_time_hours = rot_h / num_pkgs + jitter_h / max(1, num_pkgs)
+            if session_time_hours < 0.5:
+                session_time_hours = 0.5
             session_time_seconds = session_time_hours * 3600
             add_log("INFO", udid, f"[{display_name}] Found {num_pkgs} package(s). Session: {session_time_hours:.2f}h each.")
 
-            single_clone_automation_flow(d, udid, spotify_pkgs, session_time_seconds, session_time_hours, binded_account, binded_proxy, connection_type, account_type)
+            single_clone_automation_flow(d, udid, spotify_pkgs, session_time_seconds, session_time_hours, ciclo_account, binded_proxy, connection_type, account_type)
 
         except Exception as e:
             update_thread_status(udid, f'Fail [{display_name}]', None, False, False, False, False, True, None)
@@ -8732,7 +9092,7 @@ SOURCE_FILES_TO_UPDATE = [
     'main.js', 'preload.js', 'package.json',
     'Tools/spotify-signup.ps1', 'Tools/capsolver_spotify.py',
     'Tools/spotify-brave.py', 'Tools/surf_rotate.py', 'Tools/surf_gps.py', 'Tools/vpn_rotate.py',
-    'assets/surfshark-logo.svg', 'apk/Surfshark.apk',
+    'assets/surfshark-logo.svg',
     'apk/SoundAssistant.apk', 'apk/SoundAssistant_1.3.5.14.1.apk'
 ]
 

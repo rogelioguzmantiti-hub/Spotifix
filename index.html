@@ -1429,6 +1429,14 @@
                 </div>
             </div>
             <div class="card">
+                <h2>Rotar cuentas</h2>
+                <div class="form-group">
+                    <label for="rotar-cuentas">Rotar cuentas cada 4-6 horas:</label>
+                    <input type="checkbox" id="rotar-cuentas" name="rotar-cuentas" checked>
+                </div>
+                <p style="color: #888; font-size: 12px; margin-top: 5px;">Si esta activo, cada tel&eacute;fono cambia de cuenta cada 4-6 horas (nunca todos a la vez), usa las verdes y crea en el tel&eacute;fono si faltan. Si no, reproduce normal con su cuenta.</p>
+            </div>
+            <div class="card">
                 <h2>Proxy Settings</h2>
                 <div class="form-group">
                     <label for="validate-proxy">Validar Proxy antes de iniciar:</label>
@@ -1859,6 +1867,7 @@
                 <button type="button" id="accountcreatCopy" class="boton-elegante">Copiar todos</button>
                 <button type="button" id="accountcreatSave" class="boton-elegante">Guardar en .txt</button>
                 <button type="button" id="accountcreatClear" class="boton-elegante">Borrar todos</button>
+                <button type="button" id="accountcreatGreenOnly" class="boton-elegante" style="background:#2ecc71 !important;">Dejar solo verdes</button>
             </div>
             <div id="accountcreatStatus" style="margin-top:0.6rem; font-size:0.9rem; color:#aaa;">Listo.</div>
         </div>
@@ -1892,6 +1901,11 @@
                 <button type="button" id="braveStart" class="boton-elegante" style="background:#2ecc71 !important; color:#08240f; font-weight:700;">Automatizar</button>
                 <button type="button" id="braveStop" class="boton-elegante" style="background:#e74c3c !important;" disabled>Detener</button>
             </div>
+            <div class="form-group" style="margin-top:8px;">
+                <label for="braveProxies">Proxies USA (uno por linea <code>host:puerto:user:pass</code>) — <span id="braveProxiesCount">0</span>:</label>
+                <textarea id="braveProxies" spellcheck="false" placeholder="Pega aqui tus 200 proxies..." style="width:100%; box-sizing:border-box; min-height:110px; max-height:200px; overflow-y:auto; resize:vertical; font-size:12px; font-family:Consolas,monospace; color:#ccc; padding:10px; background:#1a1a2e; border:1px solid #444; border-radius:6px; white-space:pre;"></textarea>
+                <button type="button" id="braveProxiesSave" class="boton-elegante" style="margin-top:6px;">Guardar proxies</button>
+            </div>
             <div id="braveStatus" style="color:#aaa;">Listo.</div>
             <div id="braveCounts" style="margin-top:0.4rem; font-size:0.85rem; color:#888;"></div>
             <div id="braveCurrent" style="margin-top:0.4rem; font-size:0.85rem; color:#888; font-family:Consolas,monospace;"></div>
@@ -1899,7 +1913,7 @@
         <div class="card card-large">
             <h2>Cuentas creadas (<span id="braveAccCount">0</span>)</h2>
             <p class="login-help">Editable: se guarda solo en esta PC.</p>
-            <textarea id="braveAccounts" spellcheck="false" placeholder="Aqui aparecen email:contrasena de las creadas." style="width:100%; box-sizing:border-box; min-height:140px; max-height:220px; overflow-y:auto; resize:vertical; font-size:13px; font-family:Consolas,monospace; color:#ccc; padding:10px; background:#1a1a2e; border:1px solid #444; border-radius:6px; white-space:pre;"></textarea>
+            <textarea id="braveAccounts" spellcheck="false" placeholder="Aqui aparecen email:contrasena de las creadas." style="width:100%; box-sizing:border-box; min-height:140px; overflow:visible; resize:vertical; font-size:13px; font-family:Consolas,monospace; color:#ccc; padding:10px; background:#1a1a2e; border:1px solid #444; border-radius:6px; white-space:pre;"></textarea>
             <div class="form-group" style="display:flex; gap:10px; flex-wrap:wrap; margin-top:8px;">
                 <button type="button" id="braveCopy" class="boton-elegante">Copiar</button>
                 <button type="button" id="braveSaveTxt" class="boton-elegante">Guardar .txt</button>
@@ -1909,7 +1923,7 @@
         </div>
         <div class="card card-large">
             <h2>Log Brave</h2>
-            <div id="braveLog" style="max-height:420px; overflow-y:auto; font-size:13px; font-family:Consolas,monospace; color:#ccc; padding:10px; background:#1a1a2e; border-radius:6px; min-height:180px; white-space:pre-wrap;"></div>
+            <div id="braveLog" style="min-height:180px; overflow:visible; font-size:13px; font-family:Consolas,monospace; color:#ccc; padding:10px; background:#1a1a2e; border-radius:6px; min-height:180px; white-space:pre-wrap;"></div>
         </div>
     </div>
 
@@ -1977,6 +1991,7 @@
 </script>
 </body>
 </html>
+
 
 
 

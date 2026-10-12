@@ -2,7 +2,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 
 // Define allowed channels for send and receive to ensure security
 const validSendChannels = ['toggle-console', 'toggle-always-on-top', 'minimize-app', 'close-app', 'send-token', 'login-attempt', 'login-success', 'restart-app'];
-const validInvokeChannels = ['ai-status', 'ai-chat', 'ai-reset', 'automat-adb-devices', 'automat-signup-start', 'automat-signup-cancel', 'accountcreat-run', 'accountcreat-cancel', 'accountcreat-save', 'accountcreat-load', 'accountcreat-save-text', 'accountcreat-clear', 'batch-start', 'batch-continue', 'batch-stop', 'batch-export', 'batch-resume', 'batch-resume-info', 'vpn-usa-all', 'brave-start', 'brave-stop'];
+const validInvokeChannels = ['ai-status', 'ai-chat', 'ai-reset', 'automat-adb-devices', 'automat-signup-start', 'automat-signup-cancel', 'accountcreat-run', 'accountcreat-cancel', 'accountcreat-save', 'accountcreat-load', 'accountcreat-save-text', 'accountcreat-clear', 'batch-start', 'batch-continue', 'batch-stop', 'batch-export', 'batch-resume', 'batch-resume-info', 'vpn-usa-all', 'brave-start', 'brave-stop', 'proxies-save', 'proxies-load'];
 const validReceiveChannels = ['console-toggled', 'token-received', 'login-response', 'ai-progress', 'vpn-event', 'brave-event', 'automat-signup-log', 'automat-signup-done', 'accountcreat-log', 'accountcreat-done', 'batch-event'];
 
 contextBridge.exposeInMainWorld('electronAPI', {
@@ -206,6 +206,18 @@ contextBridge.exposeInMainWorld('electronAPI', {
             return ipcRenderer.invoke('brave-stop');
         }
         return Promise.resolve({ ok: true });
+    },
+    proxiesSave: (text) => {
+        if (validInvokeChannels.includes('proxies-save')) {
+            return ipcRenderer.invoke('proxies-save', { text: text });
+        }
+        return Promise.resolve({ ok: false });
+    },
+    proxiesLoad: () => {
+        if (validInvokeChannels.includes('proxies-load')) {
+            return ipcRenderer.invoke('proxies-load');
+        }
+        return Promise.resolve({ ok: true, text: '' });
     },
     onBraveEvent: (callback) => {
         if (validReceiveChannels.includes('brave-event')) {

@@ -501,10 +501,11 @@ if (!gotTheLock) {
             let resultado = 'error', detalle = 'codigo ' + code;
             if (/^OK\s+/m.test(out)) { resultado = 'ok'; detalle = ''; brave.ok++; }
             else if (/CAPTCHA_NO_RESUELTO/.test(out)) { resultado = 'captcha'; detalle = 'captcha sin resolver'; brave.fail++; }
+            else if (/^PENDIENTE\s+/m.test(out)) { resultado = 'captcha'; detalle = 'reto pendiente (resolver a mano)'; brave.fail++; }
             else { brave.fail++; }
             const seguir = () => {
                 brave.items.push({ email: email, resultado: resultado, detalle: detalle, proxy: 'brave-local', hora: new Date().toISOString() });
-                appendBatchResult(email, brave.password, resultado === 'ok' ? 'ok' : 'captcha');
+                if (resultado === 'ok') appendBatchResult(email, brave.password, 'ok');
                 braveNotify(sender, 'item', { email: email, resultado: resultado, detalle: detalle });
                 brave.index++;
                 setTimeout(() => { braveRunNext(); }, 500);
@@ -548,6 +549,28 @@ if (!gotTheLock) {
         brave = null;
         braveNotify(batchSender(), 'finished', { resumen: resumen + ' ' + exp, parcial: true });
         return { ok: true };
+    });
+
+    function userProxiesFile() {
+        return path.join(app.getPath('desktop'), 'Data', 'Proxies.txt');
+    }
+    ipcMain.handle('proxies-load', async () => {
+        try {
+            return { ok: true, text: fs.readFileSync(userProxiesFile(), 'utf8') };
+        } catch (e) { return { ok: true, text: '' }; }
+    });
+    ipcMain.handle('proxies-save', async (event, payload) => {
+        try {
+            const lines = String((payload && payload.text) || '').split(/\r?\n/)
+                .map((s) => s.trim()).filter((s) => s.length > 0);
+            fs.mkdirSync(path.dirname(userProxiesFile()), { recursive: true });
+            fs.writeFileSync(userProxiesFile(), lines.join('\n') + (lines.length ? '\n' : ''), 'utf8');
+            try {
+                const st = path.join(app.getPath('appData'), 'Spotifix', 'Spotify Mobile', 'Files', 'proxy_state.json');
+                fs.writeFileSync(st, JSON.stringify({ ts: 0, good: [], uses: {} }), 'utf8');
+            } catch (e) {}
+            return { ok: true, count: lines.length };
+        } catch (e) { return { ok: false, error: e.message }; }
     });
 
     app.on('before-quit', () => {
@@ -1562,10 +1585,8 @@ function accountcreatStateFile() {
                 batch.captcha++;
                 resultado = 'captcha';
                 detalle = 'Spotify pidio verificacion humana. Resuelvela en el movil y pulsa Continuar.';
-                // Se anota igualmente: si el reto se resuelve a mano la cuenta
-                // puede quedar creada, y asi no se pierde su contrasena. Lleva el
-                // sufijo '(verificar)' para distinguirlas de las confirmadas.
-                appendBatchResult(emailUsed, batch.password, 'captcha');
+                // Solo verdes en la lista: las de captcha van al CSV/Discord,
+                // no a la lista (se resuelven y entran cuando esten verificadas).
                 // Se para el lote: la cuenta siguiente se registraria en la
                 // pantalla del reto y el script no podria ni leerla.
                 batch.paused = true;

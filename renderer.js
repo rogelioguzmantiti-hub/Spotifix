@@ -946,6 +946,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     document.getElementById('apple-search-links-perc').value = config.apple_search_links_perc || 0;
                 document.getElementById('session-time').value = config.session_time;
                 document.getElementById('validate-proxy').checked = config.validate_proxy || false;
+                document.getElementById('rotar-cuentas').checked = config.rotar_cuentas !== false;
                 document.getElementById('use-webhook').checked = config.webhook.use;
                 document.getElementById('webhook-name').value = config.webhook.name;
                 document.getElementById('webhook-url').value = config.webhook.url;
@@ -1646,7 +1647,11 @@ document.addEventListener('DOMContentLoaded', () => {
                 let counts = { ok: 0, fail: 0, total: 0 };
                 function setStatus(t, c) { if (statusEl) { statusEl.textContent = t; statusEl.style.color = c || '#aaa'; } }
                 function setCounts() { if (countsEl) countsEl.textContent = 'Progreso: ' + (counts.ok + counts.fail) + '/' + counts.total + ' · correctas: ' + counts.ok + ' · con error: ' + counts.fail; }
-                function appendLog(t) { if (!logEl) return; logEl.textContent += t; logEl.scrollTop = logEl.scrollHeight; }
+                function braveGrow(el) {
+                    if (!el) return;
+                    try { el.style.height = 'auto'; el.style.height = Math.max(180, el.scrollHeight) + 'px'; } catch (e) {}
+                }
+                function appendLog(t) { if (!logEl) return; logEl.textContent += t; braveGrow(logEl); }
                 function setActive(on) {
                     active = on;
                     if (startEl) startEl.disabled = on;
@@ -1680,6 +1685,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 let braveSessionPass = '';
                 function braveAccCount() {
                     if (!accEl) return;
+                    braveGrow(accEl);
                     const n = accEl.value.split('\n').map((s) => s.trim()).filter((s) => s.length > 0).length;
                     if (accCountEl) accCountEl.textContent = n;
                     try { localStorage.setItem('braveAccounts', accEl.value); } catch (e) {}
@@ -1722,6 +1728,26 @@ document.addEventListener('DOMContentLoaded', () => {
                         if (!confirm('Borrar la lista de cuentas creadas?')) return;
                         accEl.value = '';
                         braveAccCount();
+                    });
+                }
+                const pxEl = document.getElementById('braveProxies');
+                const pxCountEl = document.getElementById('braveProxiesCount');
+                const pxCount = () => {
+                    if (!pxEl) return;
+                    const n = pxEl.value.split('\n').map((s) => s.trim()).filter((s) => s.length > 0).length;
+                    if (pxCountEl) pxCountEl.textContent = n;
+                };
+                if (pxEl) {
+                    api.proxiesLoad().then((res) => {
+                        if (res && res.text) { pxEl.value = res.text; }
+                        pxCount();
+                    });
+                    pxEl.addEventListener('input', pxCount);
+                    document.getElementById('braveProxiesSave').addEventListener('click', () => {
+                        api.proxiesSave(pxEl.value).then((res) => {
+                            if (res && res.ok) { setStatus('Proxies guardados: ' + res.count + '. Se verifican al usar.', '#2ecc71'); pxCount(); }
+                            else setStatus('Error guardando: ' + ((res && res.error) || ''), '#e74c3c');
+                        });
                     });
                 }
                 api.onBraveEvent((ev) => {
@@ -1774,6 +1800,18 @@ document.addEventListener('DOMContentLoaded', () => {
                     if (countEl) countEl.textContent = String(count());
                 }
 
+                function greenOnly() {
+                    const keep = logEl.value.split('\n').filter((l) => {
+                        const t = l.trim();
+                        if (!t) return false;
+                        if (/\(verificar\)/i.test(t)) return false;
+                        return /^[^@\s]+@[^@\s]+\.[^@\s]+:.+$/.test(t);
+                    });
+                    logEl.value = keep.length ? keep.join('\n') + '\n' : '';
+                    persist();
+                    updateCount();
+                    renderAccountcreatList(logEl.value);
+                }
                 function persist() {
                     api.accountcreatSaveText({ text: logEl.value });
                 }
@@ -1918,6 +1956,13 @@ document.addEventListener('DOMContentLoaded', () => {
                     });
                 }
 
+                const greenOnlyEl = document.getElementById('accountcreatGreenOnly');
+                if (greenOnlyEl) {
+                    greenOnlyEl.addEventListener('click', () => {
+                        greenOnly();
+                        setStatus('Lista con solo verdes.', false);
+                    });
+                }
                 if (clearEl) {
                     clearEl.addEventListener('click', () => {
                         if (!logEl.value.trim()) {
@@ -2347,6 +2392,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     apple_search_links_perc: document.getElementById('apple-search-links-perc') ? document.getElementById('apple-search-links-perc').value : 0,
                     session_time: document.getElementById('session-time').value,
                     validate_proxy: document.getElementById('validate-proxy').checked,
+                    rotar_cuentas: document.getElementById('rotar-cuentas').checked,
                     selected_apps: selectedApps,
                     webhook: {
                         use: document.getElementById('use-webhook').checked,
