@@ -1664,7 +1664,8 @@ document.addEventListener('DOMContentLoaded', () => {
                     if (currentEl) currentEl.textContent = '';
                     setActive(true);
                     braveSessionPass = passEl.value;
-                    api.braveStart({ cantidad: cantidad, password: passEl.value }).then((res) => {
+                    const rotEl = document.getElementById('braveRotate');
+                    api.braveStart({ cantidad: cantidad, password: passEl.value, rotateVpn: !rotEl || rotEl.checked }).then((res) => {
                         if (!res || !res.ok) { setStatus((res && res.error) || 'No se pudo iniciar.', '#e74c3c'); setActive(false); return; }
                         counts.total = res.total;
                         setCounts();

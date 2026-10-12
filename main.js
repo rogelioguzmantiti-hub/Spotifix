@@ -497,15 +497,27 @@ if (!gotTheLock) {
         p2.on('close', (code) => {
             if (!brave) return;
             brave.proc = null;
+            const rotar = brave.rotateVpn && /CAPTCHA_NO_RESUELTO|\[captcha\] reto detectado/i.test(out);
             let resultado = 'error', detalle = 'codigo ' + code;
             if (/^OK\s+/m.test(out)) { resultado = 'ok'; detalle = ''; brave.ok++; }
             else if (/CAPTCHA_NO_RESUELTO/.test(out)) { resultado = 'captcha'; detalle = 'captcha sin resolver'; brave.fail++; }
             else { brave.fail++; }
-            brave.items.push({ email: email, resultado: resultado, detalle: detalle, proxy: 'brave-local', hora: new Date().toISOString() });
-            appendBatchResult(email, brave.password, resultado === 'ok' ? 'ok' : 'captcha');
-            braveNotify(sender, 'item', { email: email, resultado: resultado, detalle: detalle });
-            brave.index++;
-            setTimeout(() => { braveRunNext(); }, 500);
+            const seguir = () => {
+                brave.items.push({ email: email, resultado: resultado, detalle: detalle, proxy: 'brave-local', hora: new Date().toISOString() });
+                appendBatchResult(email, brave.password, resultado === 'ok' ? 'ok' : 'captcha');
+                braveNotify(sender, 'item', { email: email, resultado: resultado, detalle: detalle });
+                brave.index++;
+                setTimeout(() => { braveRunNext(); }, 500);
+            };
+            if (rotar) {
+                braveNotify(sender, 'log', { texto: '  [vpn] captcha detectado: rotando IP USA...' });
+                exec('python "' + path.join(appPath, 'Tools', 'vpn_rotate.py') + '" --rotate', { windowsHide: true, timeout: 300000 }, (err, stdout) => {
+                    braveNotify(sender, 'log', { texto: '  [vpn] ' + String(stdout || '').trim().split('\n').slice(-3).join(' | ') });
+                    seguir();
+                });
+                return;
+            }
+            seguir();
         });
     }
     ipcMain.handle('brave-start', async (event, payload) => {
@@ -520,7 +532,7 @@ if (!gotTheLock) {
         const gen = await runPythonEmails(cantidad);
         if (!gen.ok) return { ok: false, error: gen.error };
         if (!gen.emails.length) return { ok: false, error: 'No se genero ningun correo.' };
-        brave = { queue: gen.emails, index: 0, password: p.password, proc: null, stopped: false, items: [], ok: 0, fail: 0 };
+        brave = { queue: gen.emails, index: 0, password: p.password, proc: null, stopped: false, items: [], ok: 0, fail: 0, rotateVpn: p.rotateVpn !== false };
         braveNotify(sender, 'phase', 'Brave iniciado: ' + gen.emails.length + ' cuenta(s).');
         discordNotify('Spotifix Brave iniciado: ' + gen.emails.length + ' cuenta(s).');
         braveRunNext();

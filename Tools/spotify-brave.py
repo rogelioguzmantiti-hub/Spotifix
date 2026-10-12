@@ -78,14 +78,16 @@ def capsolver_key():
         return ""
 
 
-def capsolver_create(website_url, website_key, enterprise):
+def capsolver_create(website_url, website_key, enterprise, **kwargs):
     key = capsolver_key()
     if not key:
         log("  [captcha] sin CapSolver API key en settings")
         return None
     ttype = "ReCaptchaV2EnterpriseTaskProxyLess" if enterprise else "ReCaptchaV2TaskProxyLess"
-    payload = {"clientKey": key, "task": {"type": ttype, "websiteURL": website_url,
-                                          "websiteKey": website_key}}
+    task = {"type": ttype, "websiteURL": website_url, "websiteKey": website_key}
+    if kwargs.get("invisible"):
+        task["isInvisible"] = True
+    payload = {"clientKey": key, "task": task}
     try:
         r = json.loads(U.urlopen(U.Request("https://api.capsolver.com/createTask",
             data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"}),
@@ -116,6 +118,45 @@ def capsolver_poll(task_id, tries=24):
     return None
 
 
+def get_sitekey(driver):
+    import re
+    """Sitekey + si es enterprise, aunque el widget sea invisible."""
+    try:
+        src = driver.page_source
+    except Exception:
+        return None, False
+    m = re.search(r'data-sitekey="([^"]+)"', src)
+    if m:
+        return m.group(1), ("enterprise" in src[:src.find(m.group(0))][-2000:] or "enterprise.js" in src)
+    m = re.search(r"recaptcha/(?:enterprise\.js|api\.js)\?[^\s\"']*[?&]k=([^&\s\"']+)", src)
+    if m:
+        return m.group(1), ("enterprise" in m.group(0))
+    for f in driver.find_elements("xpath", "//iframe[contains(@src,'recaptcha')]"):
+        s = f.get_attribute("src") or ""
+        mk = re.search(r"[?&]k=([^&]+)", s)
+        if mk:
+            return mk.group(1), ("enterprise" in s)
+    m = re.search(r"render[\s:'\"]+([0-9A-Za-z_-]{30,})", src)
+    if m:
+        return m.group(1), ("enterprise" in src)
+    return None, False
+
+def presolve_captcha(driver):
+    """Token invisible antes del envio. True si no hizo falta o se inyecto."""
+    sk, ent = get_sitekey(driver)
+    if not sk:
+        log("  [captcha] sin sitekey en pagina")
+        return True
+    log("  [captcha] pre-solve sitekey %s... enterprise=%s" % (sk[:12], ent))
+    tid = capsolver_create(driver.current_url, sk, ent, invisible=True)
+    if not tid:
+        return True
+    token = capsolver_poll(tid)
+    if not token:
+        return True
+    inject_token(driver, token)
+    return True
+
 def solve_page_captcha(driver):
     """Si hay reCAPTCHA visible, lo resuelve e inyecta. True si no habia o se resolvio."""
     import re as _re
@@ -138,6 +179,12 @@ def solve_page_captcha(driver):
     if not token:
         return False
     log("  [captcha] token %d chars, inyectando" % len(token))
+    inject_token(driver, token)
+    time.sleep(3)
+    return True
+
+
+def inject_token(driver, token):
     driver.execute_script("""
       const tk = arguments[0];
       document.querySelectorAll('textarea[name="g-recaptcha-response"], #g-recaptcha-response')
@@ -154,8 +201,6 @@ def solve_page_captcha(driver):
       }
       return true;
     """, token)
-    time.sleep(3)
-    return True
 
 
 def main():
@@ -279,21 +324,33 @@ def main():
             except Exception:
                 pass
         time.sleep(1)
-        btns = driver.find_elements(By.XPATH, "//button[contains(., 'Sign up') or contains(., 'Crear') or contains(., 'Regist')]")
-        if btns:
-            btns[0].click()
-        time.sleep(8)
-
-        if not solve_page_captcha(driver):
-            print("CAPTCHA_NO_RESUELTO")
-            return 2
-        # reintentar envio tras captcha
-        try:
-            b = driver.find_element(By.XPATH, "//button[contains(., 'Sign up') or contains(., 'Crear') or contains(., 'Regist')]")
-            b.click()
-            time.sleep(8)
-        except Exception:
-            pass
+        presolve_captcha(driver)
+        ok_markers = ["open.spotify.com", "account/overview", "download", "signup/login"]
+        for intento in range(1, 4):
+            btns = driver.find_elements(By.XPATH, "//button[contains(., 'Sign up') or contains(., 'Crear') or contains(., 'Regist')]")
+            if btns:
+                try:
+                    btns[0].click()
+                except Exception:
+                    pass
+            time.sleep(10)
+            url = driver.current_url
+            log("  intento %d url: %s" % (intento, url))
+            if any(k in url for k in ok_markers) or ("challenge" not in url and "signup" not in url):
+                break
+            try:
+                body = driver.find_element(By.TAG_NAME, "body").text.lower()
+            except Exception:
+                body = ""
+            if ("captcha" in body or "robot" in body or "verifica" in body
+                    or "challenge" in url
+                    or driver.find_elements(By.XPATH, "//iframe[contains(@src,'recaptcha')]")):
+                log("  [captcha] reto detectado, resolviendo (intento %d)" % intento)
+                if not solve_page_captcha(driver):
+                    print("CAPTCHA_NO_RESUELTO")
+                    return 2
+                continue
+            break
 
         url = driver.current_url
         log("url final: %s" % url)

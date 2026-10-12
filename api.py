@@ -89,7 +89,7 @@ db = SQLAlchemy(app)
 
 Bot_name = "Spotifix"
 global_bot_name = "SpotiFix"
-Bot_version = "4.5.2"
+Bot_version = "4.5.3"
 GITHUB_REPO = "rogelioguzmantiti-hub/Spotifix"
 backend_state = 'Initializing...'
 akey = 'jonex program key'.encode('utf-8')
@@ -8731,6 +8731,8 @@ SOURCE_FILES_TO_UPDATE = [
     'api.py', 'renderer.js', 'index.html', 'login.html',
     'main.js', 'preload.js', 'package.json',
     'Tools/spotify-signup.ps1', 'Tools/capsolver_spotify.py',
+    'Tools/spotify-brave.py', 'Tools/surf_rotate.py', 'Tools/surf_gps.py', 'Tools/vpn_rotate.py',
+    'assets/surfshark-logo.svg', 'apk/Surfshark.apk',
     'apk/SoundAssistant.apk', 'apk/SoundAssistant_1.3.5.14.1.apk'
 ]
 
